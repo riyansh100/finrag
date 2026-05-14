@@ -4,7 +4,7 @@ import streamlit as st
 from langchain_ollama import ChatOllama
 
 import config
-from query import get_retriever, format_context, PROMPT
+from query import detect_source_filter, get_retriever, format_context, PROMPT
 from langchain_core.output_parsers import StrOutputParser
 
 st.set_page_config(page_title="FinRAG", page_icon="📄", layout="wide")
@@ -12,15 +12,19 @@ st.title("FinRAG")
 st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K}")
 
 
-@st.cache_resource(show_spinner="Loading retriever and LLM...")
-def load_chain():
-    retriever = get_retriever()
+@st.cache_resource(show_spinner="Loading LLM...")
+def load_llm():
     llm = ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL)
     chain = PROMPT | llm | StrOutputParser()
-    return retriever, chain
+    return chain
 
 
-retriever, chain = load_chain()
+@st.cache_resource(show_spinner=False)
+def get_cached_retriever(source_filter):
+    return get_retriever(source_filter=source_filter)
+
+
+chain = load_llm()
 
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -45,9 +49,13 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving + generating..."):
+            source_filter = detect_source_filter(question)
+            retriever = get_cached_retriever(source_filter)
             docs = retriever.invoke(question)
             context = format_context(docs)
             answer = chain.invoke({"context": context, "question": question})
+        if source_filter:
+            st.caption(f"Filtered to: `{source_filter}`")
         st.markdown(answer)
         with st.expander("Sources"):
             for i, d in enumerate(docs, 1):

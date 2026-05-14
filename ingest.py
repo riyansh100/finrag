@@ -1,6 +1,8 @@
 """Load PDFs from data/, chunk them, embed with Ollama, persist to ChromaDB."""
 
+import re
 import sys
+import shutil
 import fitz  # PyMuPDF
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -10,15 +12,30 @@ from langchain_community.vectorstores import Chroma
 import config
 
 
+def author_from_filename(name):
+    """B076_RiyanshSachdev_FPR.pdf -> 'Riyansh Sachdev'."""
+    stem = name.rsplit(".", 1)[0]
+    parts = stem.split("_")
+    parts = [p for p in parts if not re.fullmatch(r"B\d+", p)
+             and p.lower() not in {"fpr", "finalreport", "report", "final"}]
+    # split camelCase: "RiyanshSachdev" -> "Riyansh Sachdev"
+    expanded = []
+    for p in parts:
+        expanded.extend(re.findall(r"[A-Z][a-z]*|[a-z]+|\d+", p))
+    return " ".join(expanded) if expanded else stem
+
+
 def load_pdf(path):
+    author = author_from_filename(path.name)
     doc = fitz.open(path)
     pages = []
     for i, page in enumerate(doc):
         text = page.get_text().strip()
         if text:
+            header = f"Document: {path.name}\nAuthor: {author}\n\n"
             pages.append(Document(
-                page_content=text,
-                metadata={"source": path.name, "page": i + 1},
+                page_content=header + text,
+                metadata={"source": path.name, "author": author, "page": i + 1},
             ))
     doc.close()
     return pages
