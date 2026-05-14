@@ -11,8 +11,9 @@ import config
 from ingest import author_from_filename
 
 
-PROMPT = ChatPromptTemplate.from_template("""You are a helpful assistant answering questions using only the provided context.
-If the answer is not in the context, say you don't know. Be concise.
+PROMPT = ChatPromptTemplate.from_template("""You are a helpful assistant answering questions using only the provided context from project reports.
+Provide a thorough, well-structured answer drawing on relevant details from the context. Use multiple paragraphs or bullet points when appropriate.
+If the context does not contain enough information to answer, say so clearly and explain what is missing.
 
 Context:
 {context}
