@@ -4,7 +4,13 @@ import streamlit as st
 from langchain_ollama import ChatOllama
 
 import config
-from query import detect_source_filter, get_retriever, format_context, PROMPT
+from query import (
+    PROMPT,
+    detect_source_filter,
+    format_context,
+    is_numeric_question,
+    retrieve,
+)
 from langchain_core.output_parsers import StrOutputParser
 
 st.set_page_config(page_title="FinRAG", page_icon="📄", layout="wide")
@@ -13,34 +19,40 @@ st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K
 
 
 @st.cache_resource(show_spinner="Loading LLM...")
-def load_llm():
+def load_chain():
     llm = ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL)
-    chain = PROMPT | llm | StrOutputParser()
-    return chain
+    return PROMPT | llm | StrOutputParser()
 
 
-@st.cache_resource(show_spinner=False)
-def get_cached_retriever(source_filter):
-    return get_retriever(source_filter=source_filter)
-
-
-chain = load_llm()
+chain = load_chain()
 
 if "history" not in st.session_state:
     st.session_state.history = []
+
+
+def render_sources(docs):
+    with st.expander("Sources"):
+        for i, d in enumerate(docs, 1):
+            kind = d.metadata.get("type", "text")
+            tag = "📊 TABLE" if kind == "table" else "📄 TEXT"
+            st.markdown(
+                f"**[{i}] {d.metadata.get('source')} — p.{d.metadata.get('page')} · {tag}**"
+            )
+            if kind == "table":
+                st.markdown(d.page_content)
+            else:
+                st.text(d.page_content)
+
 
 question = st.chat_input("Ask a question about your documents...")
 
 for turn in st.session_state.history:
     with st.chat_message(turn["role"]):
+        if turn.get("flags"):
+            st.caption(" · ".join(turn["flags"]))
         st.markdown(turn["content"])
         if turn.get("sources"):
-            with st.expander("Sources"):
-                for i, d in enumerate(turn["sources"], 1):
-                    st.markdown(
-                        f"**[{i}] {d.metadata.get('source')} — p.{d.metadata.get('page')}**"
-                    )
-                    st.text(d.page_content)
+            render_sources(turn["sources"])
 
 if question:
     st.session_state.history.append({"role": "user", "content": question})
@@ -50,20 +62,23 @@ if question:
     with st.chat_message("assistant"):
         with st.spinner("Retrieving + generating..."):
             source_filter = detect_source_filter(question)
-            retriever = get_cached_retriever(source_filter)
-            docs = retriever.invoke(question)
+            docs, numeric = retrieve(question, source_filter=source_filter)
             context = format_context(docs)
             answer = chain.invoke({"context": context, "question": question})
-        if source_filter:
-            st.caption(f"Filtered to: `{source_filter}`")
-        st.markdown(answer)
-        with st.expander("Sources"):
-            for i, d in enumerate(docs, 1):
-                st.markdown(
-                    f"**[{i}] {d.metadata.get('source')} — p.{d.metadata.get('page')}**"
-                )
-                st.text(d.page_content)
 
-    st.session_state.history.append(
-        {"role": "assistant", "content": answer, "sources": docs}
-    )
+        flags = []
+        if source_filter:
+            flags.append(f"Filtered to: `{source_filter}`")
+        if numeric:
+            flags.append("Numeric intent → table-biased retrieval")
+        if flags:
+            st.caption(" · ".join(flags))
+        st.markdown(answer)
+        render_sources(docs)
+
+    st.session_state.history.append({
+        "role": "assistant",
+        "content": answer,
+        "sources": docs,
+        "flags": flags,
+    })
