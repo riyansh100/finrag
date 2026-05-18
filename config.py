@@ -17,6 +17,11 @@ OCR_DPI = 300                # render resolution for scanned pages
 OCR_MIN_CHARS = 30           # if get_text() returns fewer chars, treat page as scanned
 OCR_LANG = "eng"
 
+# Table extraction
+TABLE_EXTRACTION_ENABLED = True
+TABLE_MIN_ROWS = 2           # ignore "tables" smaller than this (likely noise)
+TABLE_MIN_COLS = 2
+
 COLLECTION_NAME = "finrag"
 TOP_K = 8
 MMR_FETCH_K = 24

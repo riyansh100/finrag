@@ -7,3 +7,4 @@ pymupdf
 streamlit
 pytesseract
 pillow
+pdfplumber
