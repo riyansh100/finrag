@@ -5,3 +5,5 @@ langchain-ollama
 chromadb
 pymupdf
 streamlit
+pytesseract
+pillow

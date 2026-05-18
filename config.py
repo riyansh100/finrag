@@ -11,6 +11,12 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
+# OCR
+OCR_ENABLED = True
+OCR_DPI = 300                # render resolution for scanned pages
+OCR_MIN_CHARS = 30           # if get_text() returns fewer chars, treat page as scanned
+OCR_LANG = "eng"
+
 COLLECTION_NAME = "finrag"
 TOP_K = 8
 MMR_FETCH_K = 24

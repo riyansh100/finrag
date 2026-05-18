@@ -1,5 +1,9 @@
-"""Load PDFs from data/, chunk them, embed with Ollama, persist to ChromaDB."""
+"""Load PDFs from data/, chunk them, embed with Ollama, persist to ChromaDB.
 
+Phase 2 adds Tesseract OCR fallback for scanned / image-only pages.
+"""
+
+import io
 import re
 import sys
 import shutil
@@ -10,6 +14,13 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 
 import config
+
+try:
+    import pytesseract
+    from PIL import Image
+    _OCR_IMPORTS_OK = True
+except ImportError:
+    _OCR_IMPORTS_OK = False
 
 
 def author_from_filename(name):
@@ -25,20 +36,53 @@ def author_from_filename(name):
     return " ".join(expanded) if expanded else stem
 
 
+def _ocr_page(page):
+    """Render a PyMuPDF page to an image and OCR it with Tesseract."""
+    if not _OCR_IMPORTS_OK:
+        return ""
+    zoom = config.OCR_DPI / 72.0  # PDF default is 72 DPI
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    try:
+        return pytesseract.image_to_string(img, lang=config.OCR_LANG).strip()
+    except pytesseract.TesseractNotFoundError:
+        return ""
+
+
 def load_pdf(path):
     author = author_from_filename(path.name)
     doc = fitz.open(path)
     pages = []
+    ocr_pages = 0
     for i, page in enumerate(doc):
         text = page.get_text().strip()
-        if text:
-            header = f"Document: {path.name}\nAuthor: {author}\n\n"
-            pages.append(Document(
-                page_content=header + text,
-                metadata={"source": path.name, "author": author, "page": i + 1},
-            ))
+        used_ocr = False
+
+        if config.OCR_ENABLED and len(text) < config.OCR_MIN_CHARS:
+            ocr_text = _ocr_page(page)
+            if len(ocr_text) > len(text):
+                text = ocr_text
+                used_ocr = True
+
+        if not text:
+            continue
+
+        header = f"Document: {path.name}\nAuthor: {author}\n\n"
+        pages.append(Document(
+            page_content=header + text,
+            metadata={
+                "source": path.name,
+                "author": author,
+                "page": i + 1,
+                "ocr": used_ocr,
+            },
+        ))
+        if used_ocr:
+            ocr_pages += 1
+
     doc.close()
-    return pages
+    return pages, ocr_pages
 
 
 def main():
@@ -51,11 +95,20 @@ def main():
     for p in pdf_paths:
         print(f"  - {p.name}")
 
+    if config.OCR_ENABLED and not _OCR_IMPORTS_OK:
+        print("  [warn] OCR enabled but pytesseract / Pillow not installed; "
+              "scanned pages will be skipped. Run: pip install pytesseract pillow")
+
     all_docs = []
+    total_ocr = 0
     for path in pdf_paths:
-        pages = load_pdf(path)
-        print(f"  {path.name}: {len(pages)} non-empty pages")
+        pages, ocr_count = load_pdf(path)
+        suffix = f" ({ocr_count} via OCR)" if ocr_count else ""
+        print(f"  {path.name}: {len(pages)} non-empty pages{suffix}")
         all_docs.extend(pages)
+        total_ocr += ocr_count
+    if total_ocr:
+        print(f"\nOCR fallback used on {total_ocr} page(s) total.")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE,
