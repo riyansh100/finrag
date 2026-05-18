@@ -1,0 +1,90 @@
+# FinRAG evaluation set.
+#
+# Each item:
+#   question:           the user question
+#   expect_source:      filename (or list) that MUST appear in retrieved chunks
+#   expect_filter:      filename the source-filter should resolve to (null = no filter)
+#   expect_substrings:  list of strings that MUST all appear in the answer (case-insensitive)
+#   expect_numeric:     True if numeric-intent detection should fire
+#   forbid_substrings:  list of strings that must NOT appear (optional)
+#   notes:              freeform; not scored
+
+cases:
+  # --- Author filter + single-doc lookup ---
+  - question: "what is vikhyat's project about"
+    expect_source: B167_Vikhyat_Agrawal_FPR.pdf
+    expect_filter: B167_Vikhyat_Agrawal_FPR.pdf
+    expect_substrings: ["landslide"]
+    expect_numeric: false
+
+  - question: "summarize riyansh's project"
+    expect_source: B076_RiyanshSachdev_FPR.pdf
+    expect_filter: B076_RiyanshSachdev_FPR.pdf
+    expect_substrings: ["finseal"]
+    expect_numeric: false
+
+  - question: "what tech stack did prakarsh use"
+    expect_source: B077_PrakarshGarg_FinalReport.pdf
+    expect_filter: B077_PrakarshGarg_FinalReport.pdf
+    expect_substrings: ["react", "flask"]
+    expect_numeric: false
+
+  - question: "what problem is sarah solving"
+    expect_source: B012_SarahSyed_FPR.pdf
+    expect_filter: B012_SarahSyed_FPR.pdf
+    expect_substrings: ["ex-gratia"]
+    expect_numeric: false
+
+  # --- OCR'd content (Jash) ---
+  - question: "what does prodigal softtech do"
+    expect_source: B016_JashUpadhyay_FPR.pdf
+    expect_filter: null
+    expect_substrings: ["prodigal"]
+    expect_numeric: false
+    notes: "Tests OCR path + BM25 entity match — no author name in question, so no filter expected."
+
+  # --- Numeric / table retrieval on financial docs ---
+  - question: "what are the total assets of apex financial services"
+    expect_source: synthetic_balance_sheet_2.pdf
+    expect_filter: null
+    expect_substrings: ["825,000"]
+    expect_numeric: true
+
+  - question: "what was the amount for inventory only for apex financial services"
+    expect_source: synthetic_balance_sheet_2.pdf
+    expect_filter: null
+    expect_substrings: ["95,000"]
+    expect_numeric: true
+    forbid_substrings: ["cannot provide", "private companies"]
+    notes: "Regression: model previously refused on this phrasing."
+
+  - question: "what is the owner equity for greencore industries"
+    expect_source: synthetic_balance_sheet_3.pdf
+    expect_filter: null
+    expect_substrings: ["600,000"]
+    expect_numeric: true
+
+  - question: "what is the cash and investments amount for nova tech solutions"
+    expect_source: synthetic_balance_sheet_1.pdf
+    expect_filter: null
+    expect_substrings: ["120,000"]
+    expect_numeric: true
+
+  # --- Cross-doc ---
+  - question: "compare total assets across the three balance sheets"
+    expect_source:
+      - synthetic_balance_sheet_1.pdf
+      - synthetic_balance_sheet_2.pdf
+      - synthetic_balance_sheet_3.pdf
+    expect_filter: null
+    expect_substrings: ["515,000", "825,000", "915,000"]
+    expect_numeric: true
+
+  # --- Negative / grounding test ---
+  - question: "what is the weather in mumbai today"
+    expect_source: null
+    expect_filter: null
+    expect_substrings: []
+    forbid_substrings: ["sunny", "rain", "celsius", "fahrenheit", "degrees"]
+    expect_numeric: false
+    notes: "Off-topic. Model must refuse rather than fabricate weather data."
