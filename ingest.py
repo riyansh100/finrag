@@ -12,10 +12,9 @@ import shutil
 import fitz  # PyMuPDF
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
 
 import config
+from embeddings import make_embeddings, make_vectorstore
 
 try:
     import pytesseract
@@ -31,8 +30,15 @@ except ImportError:
     _PDFPLUMBER_OK = False
 
 
+def _looks_like_person_report(name):
+    """True for filenames like B076_RiyanshSachdev_FPR.pdf."""
+    return bool(re.match(r"B\d+_", name))
+
+
 def author_from_filename(name):
-    """B076_RiyanshSachdev_FPR.pdf -> 'Riyansh Sachdev'."""
+    """B076_RiyanshSachdev_FPR.pdf -> 'Riyansh Sachdev'. Empty string for non-person filenames."""
+    if not _looks_like_person_report(name):
+        return ""
     stem = name.rsplit(".", 1)[0]
     parts = stem.split("_")
     parts = [p for p in parts if not re.fullmatch(r"B\d+", p)
@@ -42,6 +48,15 @@ def author_from_filename(name):
     for p in parts:
         expanded.extend(re.findall(r"[A-Z][a-z]*|[a-z]+|\d+", p))
     return " ".join(expanded) if expanded else stem
+
+
+def _chunk_header(filename, author, page=None):
+    lines = [f"Document: {filename}"]
+    if author:
+        lines.append(f"Author: {author}")
+    if page is not None:
+        lines.append(f"Page: {page}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _ocr_page(page):
@@ -122,7 +137,7 @@ def load_pdf(path):
         if not text:
             continue
 
-        header = f"Document: {path.name}\nAuthor: {author}\n\n"
+        header = _chunk_header(path.name, author)
         text_docs.append(Document(
             page_content=header + text,
             metadata={
@@ -140,7 +155,7 @@ def load_pdf(path):
 
     table_docs = []
     for page_num, md in _extract_tables(path, skip_pages=ocr_page_nums):
-        header = f"Document: {path.name}\nAuthor: {author}\nPage: {page_num}\n\n"
+        header = _chunk_header(path.name, author, page=page_num)
         table_docs.append(Document(
             page_content=header + md,
             metadata={
@@ -202,20 +217,13 @@ def main():
           f"{len(table_docs_all)} table chunks = {len(chunks)} total "
           f"(chunk_size={config.CHUNK_SIZE}, overlap={config.CHUNK_OVERLAP})")
 
-    embeddings = OllamaEmbeddings(
-        model=config.EMBEDDING_MODEL,
-        base_url=config.OLLAMA_BASE_URL,
-    )
-
+    embeddings = make_embeddings()
     print(f"Embedding + persisting to {config.VECTORSTORE_DIR} ...")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=config.COLLECTION_NAME,
-        persist_directory=str(config.VECTORSTORE_DIR),
-    )
+    vectorstore = make_vectorstore(embeddings=embeddings)
+    vectorstore.add_documents(chunks)
     print(f"Done. Collection '{config.COLLECTION_NAME}' now has "
-          f"{vectorstore._collection.count()} vectors.")
+          f"{vectorstore._collection.count()} vectors "
+          f"(cosine similarity, nomic task-prefixed).")
 
 
 if __name__ == "__main__":

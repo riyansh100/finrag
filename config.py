@@ -22,6 +22,9 @@ TABLE_EXTRACTION_ENABLED = True
 TABLE_MIN_ROWS = 2           # ignore "tables" smaller than this (likely noise)
 TABLE_MIN_COLS = 2
 
+# Hybrid retrieval
+HYBRID_BM25_WEIGHT = 0.5     # vector weight = 1 - HYBRID_BM25_WEIGHT
+
 COLLECTION_NAME = "finrag"
 TOP_K = 8
 MMR_FETCH_K = 24

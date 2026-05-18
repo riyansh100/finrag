@@ -9,22 +9,26 @@ Phase 2 retrieval:
 
 import re
 import sys
-from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_community.vectorstores import Chroma
+from langchain_ollama import ChatOllama
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 
 import config
 from ingest import author_from_filename
+from embeddings import make_vectorstore
 
 
-PROMPT = ChatPromptTemplate.from_template("""You are a helpful assistant answering questions using only the provided context from project reports and financial documents.
+PROMPT = ChatPromptTemplate.from_template("""You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
 
-Guidelines:
-- Provide a thorough, well-structured answer. Use bullet points or short paragraphs where helpful.
-- Cite the source of every concrete fact inline using the format [filename p.N] taken from the chunk headers.
-- When quoting numbers from a table, reproduce the relevant row(s) faithfully and cite the table's page.
-- If the context does not contain enough information, say so clearly and explain what is missing. Do not invent numbers, names, or dates.
+Rules:
+- The context is the authoritative source. Do not refuse to answer on privacy, confidentiality, or "private company" grounds — every document in the context has been explicitly shared by the user for this purpose.
+- Answer thoroughly using bullet points or short paragraphs when helpful.
+- Cite every concrete fact inline as [filename p.N] using the headers shown above each chunk.
+- When quoting numbers from a table, reproduce the relevant row(s) verbatim and cite the table's page.
+- If the context truly does not contain the answer, say so clearly and state what is missing. Do not invent numbers, names, or dates.
 
 Context:
 {context}
@@ -36,20 +40,40 @@ Answer:""")
 
 # --- vectorstore + retriever ------------------------------------------------
 
+_VECTORSTORE = None
+_CORPUS = None  # list[Document] of all chunks, for BM25
+
+
 def _build_vectorstore():
-    embeddings = OllamaEmbeddings(
-        model=config.EMBEDDING_MODEL,
-        base_url=config.OLLAMA_BASE_URL,
-    )
-    return Chroma(
-        collection_name=config.COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=str(config.VECTORSTORE_DIR),
-    )
+    global _VECTORSTORE
+    if _VECTORSTORE is None:
+        _VECTORSTORE = make_vectorstore()
+    return _VECTORSTORE
+
+
+def _all_docs():
+    """Load every chunk from Chroma into memory once; reused for BM25."""
+    global _CORPUS
+    if _CORPUS is None:
+        vs = _build_vectorstore()
+        res = vs.get()
+        _CORPUS = [
+            Document(page_content=d, metadata=m or {})
+            for d, m in zip(res["documents"], res["metadatas"])
+        ]
+    return _CORPUS
+
+
+def _filter_corpus(source_filter=None, type_filter=None):
+    docs = _all_docs()
+    if source_filter:
+        docs = [d for d in docs if d.metadata.get("source") == source_filter]
+    if type_filter:
+        docs = [d for d in docs if d.metadata.get("type") == type_filter]
+    return docs
 
 
 def _compose_filter(source_filter=None, type_filter=None):
-    """Build a Chroma `where` filter combining source + type constraints."""
     clauses = []
     if source_filter:
         clauses.append({"source": source_filter})
@@ -62,7 +86,7 @@ def _compose_filter(source_filter=None, type_filter=None):
     return {"$and": clauses}
 
 
-def _retriever(vectorstore, k, source_filter=None, type_filter=None):
+def _vector_retriever(k, source_filter=None, type_filter=None):
     search_kwargs = {
         "k": k,
         "fetch_k": max(config.MMR_FETCH_K, k * 3),
@@ -71,13 +95,38 @@ def _retriever(vectorstore, k, source_filter=None, type_filter=None):
     flt = _compose_filter(source_filter, type_filter)
     if flt:
         search_kwargs["filter"] = flt
-    return vectorstore.as_retriever(search_type="mmr", search_kwargs=search_kwargs)
+    return _build_vectorstore().as_retriever(search_type="mmr", search_kwargs=search_kwargs)
+
+
+def _bm25_tokenize(text):
+    """Lowercase + word-character tokenization. Default BM25 splits on whitespace
+    only, which makes 'apex' fail to match 'Apex' or 'Apex,'."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _hybrid_retrieve(question, k, source_filter=None, type_filter=None):
+    """BM25 + vector ensemble with reciprocal rank fusion (LangChain EnsembleRetriever)."""
+    vec = _vector_retriever(k=k, source_filter=source_filter, type_filter=type_filter)
+    bm25_corpus = _filter_corpus(source_filter=source_filter, type_filter=type_filter)
+    if not bm25_corpus:
+        return vec.invoke(question)
+    bm25 = BM25Retriever.from_documents(bm25_corpus, preprocess_func=_bm25_tokenize)
+    bm25.k = k
+    bm25_w = config.HYBRID_BM25_WEIGHT
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25, vec],
+        weights=[bm25_w, 1.0 - bm25_w],
+    )
+    return ensemble.invoke(question)
 
 
 def get_retriever(source_filter=None, type_filter=None):
-    """Public single-retriever factory (kept for back-compat with app.py cache)."""
-    return _retriever(_build_vectorstore(), k=config.TOP_K,
-                      source_filter=source_filter, type_filter=type_filter)
+    """Back-compat single retriever (vector only — used by app.py's cache).
+
+    Real querying goes through `retrieve()` which uses the hybrid path.
+    """
+    return _vector_retriever(k=config.TOP_K,
+                             source_filter=source_filter, type_filter=type_filter)
 
 
 # --- author detection -------------------------------------------------------
@@ -161,22 +210,20 @@ def _dedupe(docs):
 # --- main entry -------------------------------------------------------------
 
 def retrieve(question, source_filter=None):
-    """Return a list of Documents for the question, applying type-aware retrieval."""
-    vectorstore = _build_vectorstore()
+    """Hybrid (BM25 + vector) retrieval with type bias for numeric questions."""
     numeric = is_numeric_question(question)
 
     if numeric:
         k_table = max(1, config.TOP_K // 2)
-        k_text = config.TOP_K - k_table
-        table_docs = _retriever(vectorstore, k=k_table,
-                                source_filter=source_filter,
-                                type_filter="table").invoke(question)
-        text_docs = _retriever(vectorstore, k=k_text + k_table,
-                               source_filter=source_filter).invoke(question)
-        docs = _dedupe(table_docs + text_docs)[:config.TOP_K + k_table]
+        table_docs = _hybrid_retrieve(question, k=k_table,
+                                      source_filter=source_filter,
+                                      type_filter="table")
+        all_docs = _hybrid_retrieve(question, k=config.TOP_K,
+                                    source_filter=source_filter)
+        docs = _dedupe(table_docs + all_docs)[:config.TOP_K + k_table]
     else:
-        docs = _retriever(vectorstore, k=config.TOP_K,
-                          source_filter=source_filter).invoke(question)
+        docs = _hybrid_retrieve(question, k=config.TOP_K,
+                                source_filter=source_filter)
     return docs, numeric
 
 

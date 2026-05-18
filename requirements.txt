@@ -8,3 +8,4 @@ streamlit
 pytesseract
 pillow
 pdfplumber
+rank-bm25
