@@ -17,6 +17,8 @@ A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. 
 | Retrieval fusion | LangChain `EnsembleRetriever` (reciprocal rank fusion)                                  |
 | PDF parsing      | [PyMuPDF](https://pymupdf.readthedocs.io) (`fitz`) for text, [pdfplumber](https://github.com/jsvine/pdfplumber) for tables |
 | OCR              | [Tesseract](https://github.com/tesseract-ocr/tesseract) via `pytesseract`               |
+| Borderless tables| [Camelot](https://camelot-py.readthedocs.io) (`stream` flavour, needs Ghostscript)      |
+| Tables on scans  | [img2table](https://github.com/xavctn/img2table) (OpenCV layout detection + Tesseract OCR) |
 | Chunking & chain | [LangChain](https://python.langchain.com) (core + community + classic)                  |
 | UI               | [Streamlit](https://streamlit.io)                                                       |
 
@@ -65,6 +67,8 @@ finrag/
 | `TABLE_EXTRACTION_ENABLED` | `True`                 | Master switch for pdfplumber table extraction                        |
 | `TABLE_MIN_ROWS`           | `2`                    | Filter out "tables" smaller than this (likely noise)                 |
 | `TABLE_MIN_COLS`           | `2`                    |                                                                      |
+| `TABLE_STREAM_FALLBACK_ENABLED` | `True`            | Run Camelot stream when pdfplumber finds no tables on a native page  |
+| `TABLE_OCR_ENABLED`        | `True`                 | Run img2table on rendered images of OCR'd pages                      |
 
 Changing `EMBEDDING_MODEL`, `CHUNK_SIZE`, the OCR/table flags, or any header behaviour requires deleting `vectorstore/` and re-running `ingest.py`.
 
@@ -95,10 +99,14 @@ data/*.pdf
    │           text = _ocr_page(page)  # render at OCR_DPI, run Tesseract
    │       emit Document(type="text", header + text, metadata={source, author?, page, ocr})
    │
-   ├── For each page (skipping OCR'd pages — no vector lines to detect):
-   │       tables = pdfplumber.extract_tables()
-   │       for t in tables:
-   │           emit Document(type="table", header + markdown(t), metadata={..., type="table"})
+   ├── For each page, extract tables:
+   │       if page was OCR'd:
+   │           img2table on the rendered pixmap (Tesseract under the hood)
+   │       else:
+   │           pdfplumber (ruled tables)
+   │           if pdfplumber found nothing:
+   │               Camelot stream (borderless / whitespace-aligned tables)
+   │       each table → Document(type="table", header + markdown, metadata={..., table_engine: "plumber"|"stream"|"img2table"})
    │
    ├── RecursiveCharacterTextSplitter(1000/200) on text Documents only
    │       (tables are kept whole — never split mid-row)
@@ -106,7 +114,7 @@ data/*.pdf
    └── Chroma collection ("finrag"), cosine, nomic prefixes applied automatically
 ```
 
-Each chunk carries metadata: `source` (filename), `author` (string or `""`), `page`, `type` (`"text"` | `"table"`), `ocr` (bool).
+Each chunk carries metadata: `source` (filename), `author` (string or `""`), `page`, `type` (`"text"` | `"table"`), `ocr` (bool), and for tables, `table_engine` (`"plumber"` | `"stream"` | `"img2table"`).
 
 Chunk headers (prepended to `page_content` so they're embedded too):
 ```
@@ -250,8 +258,8 @@ The current suite (11 cases) covers: author-filter single-doc lookups, the OCR p
 - Python 3.10+ (developed on 3.13)
 - System packages:
   ```bash
-  brew install tesseract              # macOS
-  # apt-get install tesseract-ocr     # Linux
+  brew install tesseract ghostscript   # macOS (ghostscript is required by Camelot)
+  # apt-get install tesseract-ocr ghostscript   # Linux
   ```
 - Ollama installed and running:
   ```bash
@@ -297,7 +305,8 @@ python query.py "your question here"
 - **Numeric-intent table biasing.** Tables are first-class chunks (Markdown-serialised, never split) and get reserved seats in the context window when the question is quantitative. Without this, the table chunk often loses to nearby narrative pages that mention the same line items in prose.
 - **Author header injection at ingest time.** Embeds author names into every text chunk of person-style reports, so "Vikhyat's methodology" matches Vikhyat's pages even when his name doesn't appear in the body. Skipped for non-person filenames so we don't inject `Author: synthetic balance sheet 2` noise.
 - **Hard source filtering on unambiguous author mentions.** More reliable than embedding-only retrieval for name-scoped questions; complements rather than replaces it.
-- **OCR is fallback, not default.** The OCR path only fires when `get_text()` returns less than `OCR_MIN_CHARS`. Native text is always preferred (faster, lossless). OCR'd pages are skipped for table extraction (pdfplumber needs vector lines, not pixels).
+- **OCR is fallback, not default.** The OCR path only fires when `get_text()` returns less than `OCR_MIN_CHARS`. Native text is always preferred (faster, lossless).
+- **Three-engine table extraction, picked per page.** pdfplumber for ruled tables (cheap and accurate when borders exist), Camelot `stream` as a fallback for borderless/whitespace-aligned tables on native pages, and img2table on the rendered pixmap for OCR'd pages. Each chunk records which engine produced it (`table_engine` metadata) so quality can be evaluated by source.
 - **Strict grounding in the prompt.** The LLM is told the context is authoritative, must cite inline `[filename p.N]`, and must refuse rather than fabricate. Explicitly told not to refuse on privacy / "private company" grounds because the user owns the documents.
 - **Eval-gated changes.** The `--retrieval` mode runs in ~1 second, making it cheap to validate any change to chunking, filters, weights, or BM25 tokenization before paying for an LLM run.
 
@@ -308,9 +317,9 @@ python query.py "your question here"
 - **No conversational memory** — each question is answered from retrieval alone; follow-ups like "and what about the second one" won't resolve coreferences.
 - **No cross-encoder re-ranker.** The ensemble is unweighted RRF; for highly competitive numeric queries a re-ranker (e.g. `bge-reranker-base`) could push the right chunk to position 1. Not added until eval shows the need.
 - **Single-collection index.** All PDFs live in one Chroma collection; per-document or per-domain collections would help if the corpus grows past a few hundred files.
-- **Tables on scanned pages are not extracted.** pdfplumber requires vector lines; OCR'd pages get text-only chunks. A future pass could feed OCR'd page images to a layout model (`img2table`, LayoutParser) for table reconstruction.
-- **Table extraction is borderline-table only.** pdfplumber defaults catch ruled tables well; borderless / whitespace-aligned tables sometimes need Camelot's `stream` flavour (not yet wired in).
 - **BM25 corpus is loaded into memory.** Fine at this scale (hundreds of chunks); would need rework for tens of thousands.
+- **Camelot stream is noisier than pdfplumber.** It happily produces "tables" out of multi-column body text. We filter by `TABLE_MIN_ROWS` / `TABLE_MIN_COLS` and stash an `table_engine` metadata field so noisy chunks can be down-weighted later if needed.
+- **img2table quality depends on scan resolution.** Tables on low-DPI or skewed scans may be partially reconstructed; tuning `OCR_DPI` upward (and adding deskew/binarise pre-processing) helps.
 
 ---
 

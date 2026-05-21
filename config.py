@@ -21,6 +21,8 @@ OCR_LANG = "eng"
 TABLE_EXTRACTION_ENABLED = True
 TABLE_MIN_ROWS = 2           # ignore "tables" smaller than this (likely noise)
 TABLE_MIN_COLS = 2
+TABLE_STREAM_FALLBACK_ENABLED = True   # Camelot stream when pdfplumber finds nothing
+TABLE_OCR_ENABLED = True               # img2table on rendered images of OCR'd pages
 
 # Hybrid retrieval
 HYBRID_BM25_WEIGHT = 0.5     # vector weight = 1 - HYBRID_BM25_WEIGHT

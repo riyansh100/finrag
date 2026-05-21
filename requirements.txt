@@ -9,3 +9,5 @@ pytesseract
 pillow
 pdfplumber
 rank-bm25
+camelot-py[cv]
+img2table
