@@ -48,12 +48,15 @@ def resolve_pdf(query):
              f"{[p.name for p in matches]}")
 
 
-def render_page_png(path, page_num):
+VISION_DPI = 144  # vision models downsample internally; 144 is plenty and ~4x smaller than 300
+
+
+def render_page_png(path, page_num, dpi=VISION_DPI):
     doc = fitz.open(path)
     if page_num < 1 or page_num > len(doc):
         sys.exit(f"Page {page_num} out of range; {path.name} has {len(doc)} pages.")
     page = doc[page_num - 1]
-    zoom = config.OCR_DPI / 72.0
+    zoom = dpi / 72.0
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     png = pix.tobytes("png")
     doc.close()
@@ -62,7 +65,7 @@ def render_page_png(path, page_num):
 
 def describe(path, page_num, prompt, model):
     png = render_page_png(path, page_num)
-    print(f"→ Rendering {path.name} p.{page_num} at {config.OCR_DPI} DPI "
+    print(f"→ Rendering {path.name} p.{page_num} at {VISION_DPI} DPI "
           f"({len(png)//1024} KB) and sending to {model}...\n")
     response = ollama.chat(
         model=model,
