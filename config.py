@@ -6,6 +6,7 @@ VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
 LLM_MODEL = "llama3.1:8b"
 EMBEDDING_MODEL = "nomic-embed-text"
+VISION_MODEL = "moondream"            # for ad-hoc figure description; alternative: "llama3.2-vision"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 1000
