@@ -7,6 +7,16 @@ VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 LLM_MODEL = "llama3.1:8b"
 EMBEDDING_MODEL = "nomic-embed-text"
 VISION_MODEL = "granite3.2-vision:2b"   # ~2GB, document-focused; alternatives: "llama3.2-vision", "moondream"
+VISION_DPI = 144                        # render resolution for vision-model calls
+FIGURE_DESCRIPTIONS_ENABLED = False      # describe figures at ingest, store as type="figure" chunks
+FIGURE_MIN_IMAGE_PX = 200               # skip pages whose largest embedded image is smaller than this (likely logos)
+FIGURE_PROMPT = (
+    "This page contains a figure, diagram, chart, or screenshot from a project report. "
+    "Describe it thoroughly: name every visible component, label, axis, and arrow. "
+    "If it is an architecture or flow diagram, explain how the components connect. "
+    "If it is a chart, summarise the trend and key values. Be concrete and specific."
+)
+VISION_TIMEOUT_SEC = 120                # kill vision call if it takes longer than this
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 1000

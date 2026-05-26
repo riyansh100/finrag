@@ -47,6 +47,13 @@ except ImportError:
     _IMG2TABLE_OK = False
     _IMG2TABLE_OCR = None
 
+try:
+    import base64
+    import ollama
+    _OLLAMA_OK = True
+except ImportError:
+    _OLLAMA_OK = False
+
 
 # --- filename / header helpers ---------------------------------------------
 
@@ -80,14 +87,51 @@ def _chunk_header(filename, author, page=None):
 
 # --- OCR -------------------------------------------------------------------
 
-def _render_page_image(page):
-    """Render a PyMuPDF page to a PIL Image at OCR_DPI. Returns (PIL.Image, png_bytes)."""
-    zoom = config.OCR_DPI / 72.0
+def _render_page_image(page, dpi=None):
+    """Render a PyMuPDF page to a PIL Image. Returns (PIL.Image, png_bytes)."""
+    dpi = dpi or config.OCR_DPI
+    zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
     png_bytes = pix.tobytes("png")
     img = Image.open(io.BytesIO(png_bytes))
     return img, png_bytes
+
+
+def _page_has_significant_image(page, min_px=None):
+    """True if the page has at least one embedded image >= min_px on either side."""
+    min_px = min_px or config.FIGURE_MIN_IMAGE_PX
+    try:
+        images = page.get_images(full=False)
+    except Exception:
+        return False
+    for img_ref in images:
+        # img_ref tuple: (xref, smask, w, h, bpc, colorspace, ...)
+        w, h = img_ref[2], img_ref[3]
+        if w >= min_px or h >= min_px:
+            return True
+    return False
+
+
+def _describe_page_with_vision(page):
+    """Run the vision model over a rendered page; return description text or empty string."""
+    if not (config.FIGURE_DESCRIPTIONS_ENABLED and _OLLAMA_OK):
+        return ""
+    _, png_bytes = _render_page_image(page, dpi=config.VISION_DPI)
+    try:
+        response = ollama.chat(
+            model=config.VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": config.FIGURE_PROMPT,
+                "images": [base64.b64encode(png_bytes).decode("ascii")],
+            }],
+            options={"temperature": 0.1},
+        )
+        return (response.get("message", {}).get("content") or "").strip()
+    except Exception as e:
+        print(f"    [warn] vision call failed: {type(e).__name__}: {e}")
+        return ""
 
 
 def _ocr_image(img):
@@ -211,7 +255,8 @@ def load_pdf(path):
 
     text_docs = []
     table_docs = []
-    counts = {"ocr": 0, "plumber": 0, "stream": 0, "img2table": 0}
+    figure_docs = []
+    counts = {"ocr": 0, "plumber": 0, "stream": 0, "img2table": 0, "figure": 0}
 
     for i, page in enumerate(doc):
         page_num = i + 1
@@ -262,10 +307,26 @@ def load_pdf(path):
                           "ocr": used_ocr, "table_engine": engine},
             ))
 
+        # Figure description (native pages only — OCR'd pages ARE images and
+        # would all match; skip them to avoid noise).
+        if (config.FIGURE_DESCRIPTIONS_ENABLED
+                and not used_ocr
+                and _page_has_significant_image(page)):
+            desc = _describe_page_with_vision(page)
+            if desc:
+                figure_docs.append(Document(
+                    page_content=_chunk_header(path.name, author, page=page_num)
+                                 + "Figure description:\n" + desc,
+                    metadata={"source": path.name, "author": author,
+                              "page": page_num, "type": "figure",
+                              "ocr": False, "vision_model": config.VISION_MODEL},
+                ))
+                counts["figure"] += 1
+
     if plumber is not None:
         plumber.close()
     doc.close()
-    return text_docs, table_docs, counts
+    return text_docs, table_docs, figure_docs, counts
 
 
 # --- driver ----------------------------------------------------------------
@@ -288,12 +349,15 @@ def main():
         print("  [warn] camelot-py missing; borderless-table fallback disabled.")
     if config.TABLE_OCR_ENABLED and not _IMG2TABLE_OK:
         print("  [warn] img2table missing; tables on scanned pages will be missed.")
+    if config.FIGURE_DESCRIPTIONS_ENABLED and not _OLLAMA_OK:
+        print("  [warn] ollama python pkg missing; figure descriptions disabled.")
 
     text_docs_all = []
     table_docs_all = []
-    totals = {"ocr": 0, "plumber": 0, "stream": 0, "img2table": 0}
+    figure_docs_all = []
+    totals = {"ocr": 0, "plumber": 0, "stream": 0, "img2table": 0, "figure": 0}
     for path in pdf_paths:
-        text_docs, table_docs, counts = load_pdf(path)
+        text_docs, table_docs, figure_docs, counts = load_pdf(path)
         bits = [f"{len(text_docs)} text pages"]
         if counts["ocr"]:
             bits.append(f"{counts['ocr']} via OCR")
@@ -303,9 +367,12 @@ def main():
                 table_bits.append(f"{counts[engine]} {engine}")
         if table_bits:
             bits.append(f"tables: {', '.join(table_bits)}")
+        if counts["figure"]:
+            bits.append(f"{counts['figure']} figures")
         print(f"  {path.name}: " + "; ".join(bits))
         text_docs_all.extend(text_docs)
         table_docs_all.extend(table_docs)
+        figure_docs_all.extend(figure_docs)
         for k in totals:
             totals[k] += counts[k]
 
@@ -315,6 +382,8 @@ def main():
           f"{totals['stream']} camelot-stream + "
           f"{totals['img2table']} img2table "
           f"= {len(table_docs_all)} total.")
+    print(f"Figures described: {len(figure_docs_all)} "
+          f"(model: {config.VISION_MODEL}).")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE,
@@ -322,9 +391,10 @@ def main():
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     text_chunks = splitter.split_documents(text_docs_all)
-    chunks = text_chunks + table_docs_all
+    chunks = text_chunks + table_docs_all + figure_docs_all
     print(f"\nSplit into {len(text_chunks)} text chunks + "
-          f"{len(table_docs_all)} table chunks = {len(chunks)} total "
+          f"{len(table_docs_all)} table chunks + "
+          f"{len(figure_docs_all)} figure chunks = {len(chunks)} total "
           f"(chunk_size={config.CHUNK_SIZE}, overlap={config.CHUNK_OVERLAP})")
 
     embeddings = make_embeddings()

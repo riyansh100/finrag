@@ -20,7 +20,7 @@ st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K
 
 @st.cache_resource(show_spinner="Loading LLM...")
 def load_chain():
-    llm = ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL)
+    llm = ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0)
     return PROMPT | llm | StrOutputParser()
 
 
@@ -34,7 +34,7 @@ def render_sources(docs):
     with st.expander("Sources"):
         for i, d in enumerate(docs, 1):
             kind = d.metadata.get("type", "text")
-            tag = "📊 TABLE" if kind == "table" else "📄 TEXT"
+            tag = {"table": "📊 TABLE", "figure": "🖼️ FIGURE"}.get(kind, "📄 TEXT")
             st.markdown(
                 f"**[{i}] {d.metadata.get('source')} — p.{d.metadata.get('page')} · {tag}**"
             )
@@ -42,7 +42,6 @@ def render_sources(docs):
                 st.markdown(d.page_content)
             else:
                 st.text(d.page_content)
-
 
 question = st.chat_input("Ask a question about your documents...")
 
