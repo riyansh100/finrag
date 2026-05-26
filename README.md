@@ -2,7 +2,7 @@
 
 A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. Built as an internship project at FinSeal, targeting a private assistant for financial filings (balance sheets, annual reports, prospectuses) that runs entirely on local infrastructure — no API keys, no data egress.
 
-**Status:** Phase 2 complete. The pipeline handles native-text PDFs, scanned/image-only PDFs (via Tesseract OCR), and structured tables (via pdfplumber). Retrieval is hybrid (BM25 + vector cosine) with numeric-intent table biasing. A YAML-driven eval harness baselines retrieval and answer quality.
+**Status:** Phase 2 complete. The pipeline handles native-text PDFs, scanned/image-only PDFs (via Tesseract OCR), structured tables (via pdfplumber + Camelot + img2table), and **figures/diagrams** (via a local vision model — `granite3.2-vision:2b`). Retrieval is hybrid (BM25 + vector cosine) with numeric-intent table biasing and figure-intent figure biasing. A YAML-driven eval harness baselines retrieval and answer quality.
 
 ---
 
@@ -19,6 +19,7 @@ A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. 
 | OCR              | [Tesseract](https://github.com/tesseract-ocr/tesseract) via `pytesseract`               |
 | Borderless tables| [Camelot](https://camelot-py.readthedocs.io) (`stream` flavour, needs Ghostscript)      |
 | Tables on scans  | [img2table](https://github.com/xavctn/img2table) (OpenCV layout detection + Tesseract OCR) |
+| Vision (figures) | `granite3.2-vision:2b` via Ollama — describes diagrams/charts/screenshots into text |
 | Chunking & chain | [LangChain](https://python.langchain.com) (core + community + classic)                  |
 | UI               | [Streamlit](https://streamlit.io)                                                       |
 
@@ -38,6 +39,8 @@ finrag/
 ├── config.py                # Central settings: paths, model names, chunking, retrieval params
 ├── embeddings.py            # Nomic task-prefix wrapper + cosine-Chroma factory
 ├── ingest.py                # Pipeline: PDF → (text | OCR) + tables → chunks → embeddings → Chroma
+├── ingest_figures.py        # Standalone restartable vision-pass: adds type="figure" chunks
+├── describe_figure.py       # Ad-hoc CLI: describe a single PDF page with a vision model
 ├── query.py                 # Hybrid retrieval + RAG chain + CLI
 ├── app.py                   # Streamlit chat UI
 ├── requirements.txt
@@ -69,6 +72,12 @@ finrag/
 | `TABLE_MIN_COLS`           | `2`                    |                                                                      |
 | `TABLE_STREAM_FALLBACK_ENABLED` | `True`            | Run Camelot stream when pdfplumber finds no tables on a native page  |
 | `TABLE_OCR_ENABLED`        | `True`                 | Run img2table on rendered images of OCR'd pages                      |
+| `VISION_MODEL`             | `granite3.2-vision:2b` | Ollama vision model for figure descriptions                          |
+| `VISION_DPI`               | `144`                  | Render resolution for vision-model calls (lower than OCR — vision models downsample) |
+| `VISION_TIMEOUT_SEC`       | `120`                  | Per-call timeout so a wedged vision runner can't block the script    |
+| `FIGURE_DESCRIPTIONS_ENABLED` | `False` *(opt-in)* | Master switch; usually off in `ingest.py`, run figures via `ingest_figures.py` |
+| `FIGURE_MIN_IMAGE_PX`      | `200`                  | Skip pages whose largest embedded image is smaller than this (logos) |
+| `FIGURE_PROMPT`            | *(see config)*         | Vision prompt: describe components, labels, axes, arrows             |
 
 Changing `EMBEDDING_MODEL`, `CHUNK_SIZE`, the OCR/table flags, or any header behaviour requires deleting `vectorstore/` and re-running `ingest.py`.
 
@@ -108,13 +117,19 @@ data/*.pdf
    │               Camelot stream (borderless / whitespace-aligned tables)
    │       each table → Document(type="table", header + markdown, metadata={..., table_engine: "plumber"|"stream"|"img2table"})
    │
+   ├── Figure descriptions (separate restartable pass — `ingest_figures.py`):
+   │       for each native page where page.get_images() contains an image ≥ FIGURE_MIN_IMAGE_PX:
+   │           render at VISION_DPI → granite3.2-vision:2b → text description
+   │           → Document(type="figure", header + "Figure description:\n" + desc, metadata={..., vision_model})
+   │       idempotent: skips pages already described in the collection
+   │
    ├── RecursiveCharacterTextSplitter(1000/200) on text Documents only
    │       (tables are kept whole — never split mid-row)
    │
    └── Chroma collection ("finrag"), cosine, nomic prefixes applied automatically
 ```
 
-Each chunk carries metadata: `source` (filename), `author` (string or `""`), `page`, `type` (`"text"` | `"table"`), `ocr` (bool), and for tables, `table_engine` (`"plumber"` | `"stream"` | `"img2table"`).
+Each chunk carries metadata: `source` (filename), `author` (string or `""`), `page`, `type` (`"text"` | `"table"` | `"figure"`), `ocr` (bool), and for tables `table_engine` (`"plumber"` | `"stream"` | `"img2table"`), and for figures `vision_model` (the model that produced the description).
 
 Chunk headers (prepended to `page_content` so they're embedded too):
 ```
@@ -130,6 +145,48 @@ python ingest.py
 ```
 
 Re-running adds to the existing collection. **Wipe `vectorstore/` before re-ingesting if you want a clean rebuild** (always do this after schema-affecting changes).
+
+---
+
+## Figure descriptions (`ingest_figures.py`)
+
+Vision-model passes are slow (~30–60s per call on CPU) and can wedge the Ollama runner under sustained load. They run **separately** from the main `ingest.py` so a hang during vision can't blow up the rest of the index.
+
+Design:
+- One vision call per figure-bearing native page (OCR'd pages are skipped — they're already images, would match everything, and produce noise).
+- **Idempotent.** Skips pages whose `(source, page, type="figure")` chunk already exists in Chroma. Safe to rerun.
+- **Per-call timeout** via `ollama.Client(timeout=VISION_TIMEOUT_SEC)` so a wedged model fails one call instead of the whole script.
+- **Per-PDF persistence.** Each PDF's chunks are written to Chroma before moving to the next, so a mid-run crash keeps prior progress.
+- **Verbose progress.** Each call prints `[N/M] p.X: ok (Ys) — preview...` or `FAIL`.
+
+Usage:
+```bash
+# Plan only (no vision calls)
+python ingest_figures.py --dry-run
+
+# Validate end-to-end on a single PDF, small batch
+python ingest_figures.py --source sarah --limit 3
+
+# Run everything that isn't already done
+python ingest_figures.py
+
+# Force re-describe (e.g. after changing the prompt or model)
+python ingest_figures.py --source riyansh --force
+
+# Override prompt / model per run
+python ingest_figures.py --source vikhyat --prompt "..." --model llama3.2-vision
+```
+
+There's also **`describe_figure.py`** — a tiny ad-hoc CLI for one-shot figure inspection without touching the vectorstore:
+```bash
+python describe_figure.py riyansh 16
+```
+
+### Why a separate vision model
+`granite3.2-vision:2b` (IBM, ~2 GB) was picked over alternatives because:
+- **moondream** (1.7 GB) — couldn't read labels on dense diagrams.
+- **llama3.2-vision** (7.9 GB) — quality is great but OOM-crashes on a 16 GB MacBook when llama3.1:8b is also loaded.
+- **granite3.2-vision:2b** — purpose-built for document understanding, reads labels reliably, fits alongside the chat LLM.
 
 ---
 
