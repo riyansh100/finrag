@@ -287,6 +287,20 @@ def detect_statement_targets(question):
     return targets
 
 
+_BOARD_KEYWORDS = {
+    "director", "directors", "board", "chairman", "chairperson", "chairwoman",
+    "independent", "executive", "non-executive", "auditor", "auditors",
+    "committee", "secretary", "cfo", "officer", "management", "kmp",
+}
+
+_BOARD_PROBE = ("Board of Directors Non-Executive Chairman Independent Director "
+                "Executive Director Company Secretary Chief Financial Officer")
+
+
+def is_board_question(question):
+    return bool(set(re.findall(r"[a-z-]+", question.lower())) & _BOARD_KEYWORDS)
+
+
 def _doc_matches_statement(doc, variant, statement):
     """Match a chunk to a (variant, statement) target. Table chunks carry a
     `section` label; text chunks embed the statement title in their content, so
@@ -305,6 +319,23 @@ def _doc_matches_statement(doc, variant, statement):
 
 # --- context formatting -----------------------------------------------------
 
+_INDIAN_NUM_RE = re.compile(r"\b\d{1,3}(?: \d{2})+\b")
+
+
+def _normalize_indian_numbers(text):
+    """Collapse Indian space-grouped numbers into clean comma-formatted integers
+    so the LLM reads unambiguous values (e.g. '9 83' -> '983', '446 64' -> '44,664').
+    Only matches sequences of a 1-3 digit lead followed by 2-digit groups, which
+    is specific enough to avoid mangling version numbers or years."""
+    def repl(m):
+        digits = m.group(0).replace(" ", "")
+        try:
+            return f"{int(digits):,}"
+        except ValueError:
+            return m.group(0)
+    return _INDIAN_NUM_RE.sub(repl, text)
+
+
 def format_context(docs):
     parts = []
     for i, d in enumerate(docs, 1):
@@ -312,7 +343,7 @@ def format_context(docs):
         page = d.metadata.get("page", "?")
         kind = d.metadata.get("type", "text")
         tag = {"table": "TABLE", "figure": "FIGURE"}.get(kind, "TEXT")
-        body = d.page_content
+        body = _normalize_indian_numbers(d.page_content)
         if kind == "figure":
             # Framed so the LLM treats granite's output as authoritative content,
             # not as a meta-description to be discounted.
@@ -394,6 +425,25 @@ def retrieve(question, source_filter=None, multi_sources=None):
                                 if d.metadata.get("source") == src
                                 and d.metadata.get("page") == pg]
 
+    # 1b. Board / people questions: the actual board-listing page (often the
+    #     "Company Information" page) loses to the Corporate Governance Report,
+    #     which is dense with "director" mentions. Target the listing page.
+    board_bonus = []
+    if is_board_question(question):
+        cand = _hybrid_retrieve(_BOARD_PROBE, k=config.TOP_K,
+                                source_filter=source_filter)
+        # Prefer pages that actually LIST roles (high count of role labels).
+        def role_score(d):
+            t = d.page_content.lower()
+            return sum(t.count(r) for r in ("director", "chairman", "secretary",
+                                            "officer", "auditor"))
+        top_pages = sorted({(d.metadata.get("source"), d.metadata.get("page"))
+                            for d in cand if role_score(d) >= 3})
+        for src, pg in top_pages[:2]:
+            board_bonus += [d for d in _all_docs()
+                            if d.metadata.get("source") == src
+                            and d.metadata.get("page") == pg]
+
     # 2. Type bias.
     type_bonus = []
     if numeric:
@@ -406,7 +456,7 @@ def retrieve(question, source_filter=None, multi_sources=None):
     # 3. General hybrid base.
     base = _hybrid_retrieve(question, k=config.TOP_K, source_filter=source_filter)
 
-    docs = _dedupe(statement_bonus + type_bonus + base)[:config.MAX_CONTEXT_CHUNKS]
+    docs = _dedupe(statement_bonus + board_bonus + type_bonus + base)[:config.MAX_CONTEXT_CHUNKS]
     return docs, numeric
 
 
