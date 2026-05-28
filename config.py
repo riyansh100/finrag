@@ -4,7 +4,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
-LLM_MODEL = "llama3.1:8b"
+LLM_MODEL = "gpt-oss:20b-cloud"
 EMBEDDING_MODEL = "nomic-embed-text"
 VISION_MODEL = "granite3.2-vision:2b"   # ~2GB, document-focused; alternatives: "llama3.2-vision", "moondream"
 VISION_DPI = 144                        # render resolution for vision-model calls
@@ -17,6 +17,9 @@ FIGURE_PROMPT = (
     "If it is a chart, summarise the trend and key values. Be concrete and specific."
 )
 VISION_TIMEOUT_SEC = 120                # kill vision call if it takes longer than this
+
+# Conversational memory
+HISTORY_TURNS = 6                       # last N messages (≈ 3 Q+A pairs) passed to the LLM
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 1000

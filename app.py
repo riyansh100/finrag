@@ -4,31 +4,46 @@ import streamlit as st
 from langchain_ollama import ChatOllama
 
 import config
-from query import (
-    PROMPT,
-    detect_source_filter,
-    format_context,
-    is_numeric_question,
-    retrieve,
-)
-from langchain_core.output_parsers import StrOutputParser
+from query import ask
 
 st.set_page_config(page_title="FinRAG", page_icon="📄", layout="wide")
 st.title("FinRAG")
-st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K}")
+st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K} · "
+           f"memory: last {config.HISTORY_TURNS} turns")
 
 
 @st.cache_resource(show_spinner="Loading LLM...")
-def load_chain():
-    llm = ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0)
-    return PROMPT | llm | StrOutputParser()
+def load_llm():
+    return ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
+                      temperature=0)
 
 
-chain = load_chain()
+llm = load_llm()
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
+
+# --- sidebar -----------------------------------------------------------------
+
+with st.sidebar:
+    st.subheader("Chat")
+    if st.button("🗑️  New chat", use_container_width=True):
+        st.session_state.history = []
+        st.rerun()
+    st.caption(f"{len(st.session_state.history)} message(s) in memory")
+    st.divider()
+    st.caption("Phase 2 features active:")
+    st.markdown(
+        "- Hybrid retrieval (BM25 + vector)\n"
+        "- Author-filter detection\n"
+        "- Numeric-intent → table bias\n"
+        "- Figure-intent → figure bias\n"
+        "- Conversational memory + query rewriter"
+    )
+
+
+# --- helpers -----------------------------------------------------------------
 
 def render_sources(docs):
     with st.expander("Sources"):
@@ -43,7 +58,14 @@ def render_sources(docs):
             else:
                 st.text(d.page_content)
 
-question = st.chat_input("Ask a question about your documents...")
+
+def history_for_llm():
+    """Strip UI-only fields from session history before passing to ask()."""
+    return [{"role": t["role"], "content": t["content"]}
+            for t in st.session_state.history]
+
+
+# --- replay prior turns ------------------------------------------------------
 
 for turn in st.session_state.history:
     with st.chat_message(turn["role"]):
@@ -53,31 +75,42 @@ for turn in st.session_state.history:
         if turn.get("sources"):
             render_sources(turn["sources"])
 
+
+# --- new turn ----------------------------------------------------------------
+
+question = st.chat_input("Ask a question about your documents...")
+
 if question:
-    st.session_state.history.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
+    st.session_state.history.append({"role": "user", "content": question})
 
     with st.chat_message("assistant"):
         with st.spinner("Retrieving + generating..."):
-            source_filter = detect_source_filter(question)
-            docs, numeric = retrieve(question, source_filter=source_filter)
-            context = format_context(docs)
-            answer = chain.invoke({"context": context, "question": question})
+            # Pass history BEFORE appending the new user turn? We just appended it;
+            # ask() expects history NOT including the current question, so slice it off.
+            prior = history_for_llm()[:-1]
+            result = ask(question, history=prior, llm=llm)
 
         flags = []
-        if source_filter:
-            flags.append(f"Filtered to: `{source_filter}`")
-        if numeric:
+        if result.get("rewritten_query"):
+            flags.append(f"Rewrote → `{result['rewritten_query']}`")
+        if result["filtered_to"]:
+            flags.append(f"Filtered to: `{result['filtered_to']}`")
+        if result.get("multi_sources"):
+            flags.append("Multi-author → per-author retrieval bonus: "
+                         + ", ".join(f"`{s}`" for s in result["multi_sources"]))
+        if result["numeric"]:
             flags.append("Numeric intent → table-biased retrieval")
+
         if flags:
             st.caption(" · ".join(flags))
-        st.markdown(answer)
-        render_sources(docs)
+        st.markdown(result["answer"])
+        render_sources(result["sources"])
 
     st.session_state.history.append({
         "role": "assistant",
-        "content": answer,
-        "sources": docs,
+        "content": result["answer"],
+        "sources": result["sources"],
         "flags": flags,
     })
