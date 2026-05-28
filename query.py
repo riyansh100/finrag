@@ -37,6 +37,11 @@ Rules:
 - Answer thoroughly with bullet points or short paragraphs.
 - Cite every concrete fact inline as [filename p.N] using the headers shown above each chunk.
 - When quoting numbers from a table, reproduce the relevant row(s) verbatim and cite the page.
+- NUMBER FORMAT: these documents use Indian digit grouping where a space separates groups (e.g. "13 62" means 1362, "9 83" means 983, "(25 42)" means -2542, "1 05" means 105). Read such tokens as single numbers. Parentheses mean negative.
+- In YOUR answer, always render numbers in clean standard form with comma separators and currency/unit, e.g. write "₹1,362 lakh" or "₹983 lakh" — NEVER reproduce the raw spaced form like "13 62" or "9 83" in your output.
+- When a statement provides a LABELED TOTAL or SUBTOTAL (e.g. "Net Cash Flow from Operating Activities", "Profit for the Year"), quote that stated value directly. Do NOT recompute totals by summing line items.
+- NEVER estimate, approximate, or guess a figure. If a specific number (e.g. standalone net profit) is not present in the Context, say it is not available — do not derive it with "≈" or "roughly". A wrong number is worse than "not found".
+- Pay attention to each chunk's `Section:` label (e.g. "Standalone Statement of Profit and Loss" vs "Consolidated..."). Attribute every figure to the correct statement based on that label.
 - When describing a figure, synthesise from the [FIGURE] chunk's content; quote specific labels/components it lists.
 - If the context truly lacks the answer, say so clearly and state what is missing. Do not invent numbers, names, dates, or figure contents.
 
@@ -245,6 +250,59 @@ def is_figure_question(question):
     return bool(set(re.findall(r"[a-z]+", question.lower())) & _FIGURE_KEYWORDS)
 
 
+# --- financial-statement intent --------------------------------------------
+
+# Map query phrases -> the statement-title keyword to look for in `section` meta.
+_STATEMENT_INTENTS = {
+    "profit and loss": ["profit and loss", "profit & loss", "net profit",
+                        "profit for the year", "income statement", "p&l", "revenue",
+                        "total income", "earnings"],
+    "balance sheet": ["balance sheet", "total assets", "total equity",
+                      "liabilities", "net worth"],
+    "cash flow": ["cash flow", "operating activities", "investing activities",
+                 "financing activities"],
+    "changes in equity": ["changes in equity"],
+}
+
+_VARIANTS = ["standalone", "consolidated"]
+
+
+def detect_statement_targets(question):
+    """Return list of (variant_or_None, statement_keyword) the question implies.
+    e.g. 'standalone vs consolidated net profit' -> [('standalone','profit and loss'),
+    ('consolidated','profit and loss')]."""
+    q = question.lower()
+    statements = [stmt for stmt, kws in _STATEMENT_INTENTS.items()
+                  if any(kw in q for kw in kws)]
+    if not statements:
+        return []
+    variants = [v for v in _VARIANTS if v in q]
+    targets = []
+    for stmt in statements:
+        if variants:
+            for v in variants:
+                targets.append((v, stmt))
+        else:
+            targets.append((None, stmt))
+    return targets
+
+
+def _doc_matches_statement(doc, variant, statement):
+    """Match a chunk to a (variant, statement) target. Table chunks carry a
+    `section` label; text chunks embed the statement title in their content, so
+    check both. Table extraction sometimes drops rows (e.g. 'Profit for the
+    Year'), so the complete text chunk is often the more reliable source."""
+    section = (doc.metadata.get("section") or "").lower()
+    # First ~300 chars of content usually holds the statement title line.
+    head = doc.page_content[:300].lower()
+    hay = section + " " + head
+    if statement not in hay:
+        return False
+    if variant and variant not in hay:
+        return False
+    return True
+
+
 # --- context formatting -----------------------------------------------------
 
 def format_context(docs):
@@ -317,20 +375,38 @@ def retrieve(question, source_filter=None, multi_sources=None):
                                          source_filter=src, type_filter="figure")
         return _dedupe(docs), numeric
 
-    # Single-source or unfiltered path.
-    bonus = []
+    # Single-source or unfiltered path. Ordered by priority — most important
+    # bonus first, because the total is capped at MAX_CONTEXT_CHUNKS.
+
+    # 1. Statement-targeted (highest priority): for each (variant, statement)
+    #    the question implies, find the statement's page(s) and pull EVERY chunk
+    #    from them. Table extraction can drop rows (e.g. 'Profit for the Year'),
+    #    and the title vs the figure often land in different sub-chunks, so the
+    #    whole page is needed to guarantee complete, correctly-labelled figures.
+    statement_bonus = []
+    for variant, statement in detect_statement_targets(question):
+        probe = f"{variant or ''} {statement}".strip()
+        cand = _hybrid_retrieve(probe, k=config.TOP_K * 2, source_filter=source_filter)
+        target_pages = {(d.metadata.get("source"), d.metadata.get("page"))
+                        for d in cand if _doc_matches_statement(d, variant, statement)}
+        for src, pg in target_pages:
+            statement_bonus += [d for d in _all_docs()
+                                if d.metadata.get("source") == src
+                                and d.metadata.get("page") == pg]
+
+    # 2. Type bias.
+    type_bonus = []
     if numeric:
-        k_table = max(1, config.TOP_K // 2)
-        bonus += _hybrid_retrieve(question, k=k_table,
-                                  source_filter=source_filter,
-                                  type_filter="table")
+        type_bonus += _hybrid_retrieve(question, k=max(1, config.TOP_K // 2),
+                                       source_filter=source_filter, type_filter="table")
     if figure:
-        k_fig = max(1, config.TOP_K // 2)
-        bonus += _hybrid_retrieve(question, k=k_fig,
-                                  source_filter=source_filter,
-                                  type_filter="figure")
+        type_bonus += _hybrid_retrieve(question, k=max(1, config.TOP_K // 2),
+                                       source_filter=source_filter, type_filter="figure")
+
+    # 3. General hybrid base.
     base = _hybrid_retrieve(question, k=config.TOP_K, source_filter=source_filter)
-    docs = _dedupe(bonus + base)[:config.TOP_K + len(bonus)]
+
+    docs = _dedupe(statement_bonus + type_bonus + base)[:config.MAX_CONTEXT_CHUNKS]
     return docs, numeric
 
 

@@ -9,7 +9,7 @@ from query import ask
 st.set_page_config(page_title="FinRAG", page_icon="📄", layout="wide")
 st.title("FinRAG")
 st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K} · "
-           f"memory: last {config.HISTORY_TURNS} turns")
+           f"memory: last {config.HISTORY_TURNS // 2} Q&A pairs")
 
 
 @st.cache_resource(show_spinner="Loading LLM...")
@@ -31,7 +31,10 @@ with st.sidebar:
     if st.button("🗑️  New chat", use_container_width=True):
         st.session_state.history = []
         st.rerun()
-    st.caption(f"{len(st.session_state.history)} message(s) in memory")
+    _stored = len(st.session_state.history)
+    _sent = min(_stored, config.HISTORY_TURNS)
+    st.caption(f"{_stored} message(s) stored · last {_sent} sent to model "
+               f"(~{_sent // 2} Q&A pairs)")
     st.divider()
     st.caption("Phase 2 features active:")
     st.markdown(

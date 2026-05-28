@@ -19,7 +19,7 @@ FIGURE_PROMPT = (
 VISION_TIMEOUT_SEC = 120                # kill vision call if it takes longer than this
 
 # Conversational memory
-HISTORY_TURNS = 6                       # last N messages (≈ 3 Q+A pairs) passed to the LLM
+HISTORY_TURNS = 6                       # last N *messages* sent to LLM (6 = 3 Q&A pairs)
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 1000
@@ -45,3 +45,4 @@ COLLECTION_NAME = "finrag"
 TOP_K = 8
 MMR_FETCH_K = 24
 MMR_LAMBDA = 0.7
+MAX_CONTEXT_CHUNKS = 24      # hard cap on chunks sent to the LLM per query

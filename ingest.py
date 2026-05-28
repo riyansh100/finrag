@@ -170,6 +170,37 @@ def _table_passes_filter(rows):
             and max((len(r) for r in rows), default=0) >= config.TABLE_MIN_COLS)
 
 
+_STATEMENT_RE = re.compile(
+    r"((?:standalone|consolidated)?\s*"
+    r"(?:statement of profit and loss|balance sheet|statement of cash flow|"
+    r"cash flow statement|statement of changes in equity|"
+    r"statement of profit & loss))",
+    re.IGNORECASE,
+)
+
+
+def _statement_title(page_text):
+    """Extract a financial-statement title from page text so table chunks carry
+    their section label (standalone vs consolidated, which statement). Returns
+    the best title line, or '' if none found."""
+    matches = []
+    for line in page_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _STATEMENT_RE.search(line)
+        if m:
+            matches.append(line)
+    if not matches:
+        return ""
+    # Prefer a line that names standalone/consolidated explicitly.
+    for line in matches:
+        low = line.lower()
+        if "standalone" in low or "consolidated" in low:
+            return line
+    return matches[0]
+
+
 # --- per-page table extractors ---------------------------------------------
 
 def _extract_plumber(plumber_page):
@@ -298,13 +329,20 @@ def load_pdf(path):
             for md in mds:
                 page_tables.append((md, engine))
 
+        # Section label so a table chunk is self-describing (e.g. a balance
+        # sheet table knows it's "Consolidated" vs "Standalone").
+        title = _statement_title(text)
+        title_line = f"Section: {title}\n" if title else ""
+
         for md, engine in page_tables:
             counts[engine] += 1
             table_docs.append(Document(
-                page_content=_chunk_header(path.name, author, page=page_num) + md,
+                page_content=_chunk_header(path.name, author, page=page_num)
+                             + title_line + md,
                 metadata={"source": path.name, "author": author,
                           "page": page_num, "type": "table",
-                          "ocr": used_ocr, "table_engine": engine},
+                          "ocr": used_ocr, "table_engine": engine,
+                          "section": title},
             ))
 
         # Figure description (native pages only — OCR'd pages ARE images and
