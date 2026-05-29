@@ -171,7 +171,7 @@ Usage:
 python ingest_figures.py --dry-run
 
 # Validate end-to-end on a single PDF, small batch
-python ingest_figures.py --source sarah --limit 3
+python ingest_figures.py --source riyansh --limit 3
 
 # Run everything that isn't already done
 python ingest_figures.py
@@ -180,7 +180,7 @@ python ingest_figures.py
 python ingest_figures.py --source riyansh --force
 
 # Override prompt / model per run
-python ingest_figures.py --source vikhyat --prompt "..." --model llama3.2-vision
+python ingest_figures.py --source riyansh --prompt "..." --model llama3.2-vision
 ```
 
 There's also **`describe_figure.py`** — a tiny ad-hoc CLI for one-shot figure inspection without touching the vectorstore:
