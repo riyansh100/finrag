@@ -4,3 +4,4 @@ __pycache__/
 vectorstore/
 data/*.pdf
 .DS_Store
+db.sqlite3

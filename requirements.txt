@@ -11,3 +11,6 @@ pdfplumber
 rank-bm25
 camelot-py[cv]
 img2table
+django
+djangorestframework
+django-cors-headers
