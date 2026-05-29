@@ -1,8 +1,10 @@
 # FinRAG
 
-A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. Built as an internship project at FinSeal, targeting a private assistant for financial filings (balance sheets, annual reports, prospectuses) that runs entirely on local infrastructure — no API keys, no data egress.
+A local-first Retrieval-Augmented Generation (RAG) chatbot for PDF documents. Built as an internship project at FinSeal, targeting a private assistant for financial filings (balance sheets, annual reports, prospectuses) that runs on local infrastructure, with the option to offload the chat LLM to Ollama Cloud's free tier on RAM-constrained machines.
 
-**Status:** Phase 2 complete. The pipeline handles native-text PDFs, scanned/image-only PDFs (via Tesseract OCR), structured tables (via pdfplumber + Camelot + img2table), and **figures/diagrams** (via a local vision model — `granite3.2-vision:2b`). Retrieval is hybrid (BM25 + vector cosine) with numeric-intent table biasing and figure-intent figure biasing. A YAML-driven eval harness baselines retrieval and answer quality.
+**Status:** Phase 2 complete; backend/frontend migration (Phase 3) about to begin. The pipeline handles native-text PDFs, scanned/image-only PDFs (via Tesseract OCR), structured tables (via pdfplumber + Camelot + img2table), and **figures/diagrams** (via a local vision model — `granite3.2-vision:2b`). Retrieval is hybrid (BM25 + vector cosine) with numeric-intent table biasing, figure-intent figure biasing, statement-targeted whole-page retrieval, board/people listing retrieval, and multi-author per-source retrieval. The chat layer has **conversational memory** (query rewriter + last N turns) and Indian-number normalization for financial reports. A YAML-driven eval harness baselines retrieval and answer quality.
+
+> **Phase 3 (in progress):** replacing the Streamlit UI with a Django + DRF backend (DB-backed multi-chat history) and a plain HTML/JS frontend. On-the-fly user file upload is planned as future scope. The RAG core (`ingest.py`, `query.py`) is unchanged by this migration — Django imports and calls `ask()`.
 
 ---
 
@@ -10,7 +12,7 @@ A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. 
 
 | Layer            | Choice                                                                                  |
 | ---------------- | --------------------------------------------------------------------------------------- |
-| LLM              | `llama3.1:8b` served via [Ollama](https://ollama.com)                                   |
+| LLM              | `gpt-oss:20b-cloud` via [Ollama](https://ollama.com) Cloud (free tier; same local API). Any local Ollama chat model also works |
 | Embeddings       | `nomic-embed-text` (768-dim) via Ollama, with task prefixes (`search_query:` / `search_document:`) |
 | Vector store     | [ChromaDB](https://www.trychroma.com) (cosine similarity), persisted to disk            |
 | Keyword search   | [`rank-bm25`](https://github.com/dorianbrown/rank_bm25) via LangChain `BM25Retriever`   |
@@ -21,9 +23,11 @@ A fully offline Retrieval-Augmented Generation (RAG) chatbot for PDF documents. 
 | Tables on scans  | [img2table](https://github.com/xavctn/img2table) (OpenCV layout detection + Tesseract OCR) |
 | Vision (figures) | `granite3.2-vision:2b` via Ollama — describes diagrams/charts/screenshots into text |
 | Chunking & chain | [LangChain](https://python.langchain.com) (core + community + classic)                  |
-| UI               | [Streamlit](https://streamlit.io)                                                       |
+| Memory           | Query rewriter + `MessagesPlaceholder` history (last `HISTORY_TURNS` messages)          |
+| UI (current)     | [Streamlit](https://streamlit.io) — being replaced in Phase 3                            |
+| UI (Phase 3)     | Django + Django REST Framework backend · plain HTML/CSS/JS frontend                      |
 
-Everything runs locally; the only network calls are localhost requests to the Ollama daemon at `http://localhost:11434`.
+Embeddings, the vector store, OCR, tables, and figures run entirely locally. The only non-local calls are to the chat LLM when `gpt-oss:20b-cloud` is used — these still go through the local Ollama daemon at `http://localhost:11434`, which proxies to Ollama Cloud. Swap `LLM_MODEL` to a local model (e.g. `llama3.1:8b`) for a fully offline setup.
 
 ---
 
@@ -53,7 +57,7 @@ finrag/
 
 | Setting                    | Default                | Notes                                                                |
 | -------------------------- | ---------------------- | -------------------------------------------------------------------- |
-| `LLM_MODEL`                | `llama3.1:8b`          | Any Ollama-compatible chat model                                     |
+| `LLM_MODEL`                | `gpt-oss:20b-cloud`    | Any Ollama-compatible chat model (cloud or local)                    |
 | `EMBEDDING_MODEL`          | `nomic-embed-text`     | If it contains "nomic", task prefixes are auto-applied                |
 | `OLLAMA_BASE_URL`          | `http://localhost:11434` |                                                                    |
 | `CHUNK_SIZE`               | `1000`                 | Characters per text chunk (tables are never split)                   |
@@ -62,7 +66,9 @@ finrag/
 | `TOP_K`                    | `8`                    | Chunks returned to the LLM (more for numeric questions, see below)   |
 | `MMR_FETCH_K`              | `24`                   | Candidate pool MMR diversifies over                                  |
 | `MMR_LAMBDA`               | `0.7`                  | 1.0 = pure relevance, 0.0 = pure diversity                           |
+| `MAX_CONTEXT_CHUNKS`       | `24`                   | Hard cap on chunks sent to the LLM per query (after intent bonuses)  |
 | `HYBRID_BM25_WEIGHT`       | `0.5`                  | Weight of BM25 in the ensemble; vector weight = `1 - this`           |
+| `HISTORY_TURNS`            | `6`                    | Last N *messages* (= 3 Q&A pairs) sent to the LLM as conversation memory |
 | `OCR_ENABLED`              | `True`                 | Master switch for the OCR fallback                                   |
 | `OCR_DPI`                  | `300`                  | Render resolution for scanned pages                                  |
 | `OCR_MIN_CHARS`            | `30`                   | If `get_text()` returns fewer chars, treat the page as scanned       |
@@ -193,35 +199,42 @@ python describe_figure.py riyansh 16
 ## Query pipeline (`query.py`)
 
 ```
-question
+question (+ conversation history)
    │
-   ├── detect_source_filter(question)
-   │        ↳ if exactly one known author token (≥3 chars) appears → return that filename
+   ├── rewrite_query(question, history, llm)
+   │        ↳ rewrites follow-ups into standalone queries ("and the second one?" →
+   │           "what is the total revenue of Apex Financial Services") using few-shot prompt
    │
-   ├── is_numeric_question(question)
-   │        ↳ True if question contains financial keywords (revenue, profit, total, balance, ...)
-   │           or currency/year/number tokens
+   ├── detect_all_sources(question, rewritten) / detect_source_filter(...)
+   │        ↳ one known author token  → hard-filter to that file
+   │        ↳ two+ author tokens      → multi_sources mode (per-source retrieval bonus)
    │
-   ├── is_figure_question(question)
-   │        ↳ True if question contains figure/diagram/chart/architecture/flowchart/...
+   ├── intent detection (run on question + rewritten):
+   │        is_numeric_question   → financial keywords / currency / year / number tokens
+   │        is_figure_question    → figure/diagram/chart/architecture/flowchart/...
+   │        is_board_question     → board/directors/management/people-listing intent
+   │        detect_statement_targets → "standalone/consolidated" × "P&L / balance sheet / cash flow"
    │
-   ├── retrieve(question, source_filter):
+   ├── retrieve(question, source_filter, multi_sources):
    │       hybrid = BM25 (lowercased + word-tokenized) + Vector (Chroma MMR, cosine)
    │                fused via LangChain EnsembleRetriever (weights HYBRID_BM25_WEIGHT / 1-w)
    │
-   │       bonus = []
-   │       if numeric: bonus += hybrid(k=TOP_K//2, type_filter="table")
-   │       if figure : bonus += hybrid(k=TOP_K//2, type_filter="figure")
-   │       base = hybrid(k=TOP_K)
-   │       docs = dedupe(bonus + base)[:TOP_K + len(bonus)]   # bonus chunks come FIRST
+   │       priority order (bonuses come FIRST, then deduped, then capped at MAX_CONTEXT_CHUNKS):
+   │         statement_bonus  → WHOLE pages (text+table) matching the targeted statement
+   │         board_bonus      → people/board listing pages (via _BOARD_PROBE)
+   │         type_bonus       → table chunks (numeric) and/or figure chunks (figure)
+   │         per-source bonus → one slice per author in multi_sources mode
+   │         base             → corpus-wide hybrid (skipped in multi_sources mode)
    │
    ├── format_context(docs)
    │        ↳ "[i] (filename p.N) [TEXT|TABLE|FIGURE]\n<chunk>"
+   │        ↳ _normalize_indian_numbers(): collapse space-grouped digits ("9 83" → "983")
+   │           and format with commas ("1197" → "1,197"); safe against years / versions / note refs
    │        ↳ FIGURE chunks get an "AUTHORITATIVE TRANSCRIPTION" framing prepended
-   │           so the LLM treats them as the figure itself, not a second-hand description
    │
-   └── PROMPT | ChatOllama(llama3.1) | StrOutputParser
-            ↳ thorough answer, inline [filename p.N] citations, refuses to fabricate
+   └── PROMPT (system + history placeholder + question) | ChatOllama | StrOutputParser
+            ↳ thorough answer, inline [filename p.N] citations, refuses to fabricate,
+              reads Indian-format numbers, trusts labeled totals (never recomputes)
 ```
 
 ### Why hybrid retrieval
@@ -238,6 +251,26 @@ Half the slots in the context window are reserved for `type: "table"` chunks whe
 
 `detect_source_filter()` builds a name → filename index from `data/` (first names, last names, ≥3 chars). If a question contains tokens matching **exactly one** known author, retrieval (both BM25 and vector) is hard-filtered to that PDF. Two-author or ambiguous queries skip the filter and fall back to corpus-wide retrieval.
 
+### Statement-targeted retrieval (financial reports)
+
+For questions naming a financial statement (e.g. "consolidated cash flow", "standalone profit and loss"), `detect_statement_targets()` resolves the variant (standalone/consolidated) × statement (P&L / balance sheet / cash flow) and pulls the **whole matching pages** (both their text and table chunks) to the front of the context. This fixes a class of bugs where a statement's title, narrative, and table land in different sub-chunks and only some get retrieved — leaving the model to estimate or conflate standalone vs. consolidated figures.
+
+### Board / people-listing retrieval
+
+`is_board_question()` detects directors/board/management/people-listing intent and uses a fixed `_BOARD_PROBE` to surface the company-info / board listing page, which otherwise loses to the denser Corporate Governance pages under plain hybrid retrieval.
+
+### Multi-author retrieval
+
+When a question names two or more known authors, retrieval enters `multi_sources` mode: it drops the corpus-wide base and instead reserves a per-author slice so cross-document comparisons don't get dominated by one author's chunks (which previously caused mis-attribution).
+
+### Indian-number normalization
+
+Financial PDFs often render figures with space-grouped digits ("9 83", "11 97") that survive extraction and read as garbage. `_normalize_indian_numbers()` (applied in `format_context`) collapses these and re-formats with commas (`₹1,197 lakh`), with guards so years (`2024-25`), version numbers (`v4.1.3`), and note references (`Note 8`) are left untouched.
+
+### Conversational memory
+
+`ask()` accepts a `history` list. `rewrite_query()` first turns context-dependent follow-ups into standalone queries (so retrieval works on "and the second one?"), then the resolved history (last `HISTORY_TURNS` messages) is injected into the prompt via `MessagesPlaceholder("history")`. The UI is responsible for storing and trimming history; `ask()` only consumes what it's given.
+
 ### Inline citations
 
 The prompt requires every concrete fact to carry a `[filename p.N]` marker, taken from the chunk headers. For financial queries this makes the source of each number traceable to a specific page.
@@ -253,12 +286,15 @@ python query.py "what are the total assets of apex financial services"
 
 ```python
 from query import ask
-result = ask("what tech stack did Prakarsh use")
+result = ask("what tech stack did Prakarsh use", history=prior_messages, llm=llm)
+# history = [{"role": "user"|"assistant", "content": str}, ...]  (without the current question)
 # result = {
 #     "answer": str,
 #     "sources": List[Document],
-#     "filtered_to": str | None,    # author filter, if any
-#     "numeric": bool,              # whether table-biased retrieval ran
+#     "filtered_to": str | None,      # single-author filter, if any
+#     "multi_sources": List[str]|None,# files in multi-author per-source mode, if any
+#     "numeric": bool,                # whether table-biased retrieval ran
+#     "rewritten_query": str | None,  # standalone rewrite of a follow-up, if rewritten
 # }
 ```
 
@@ -266,13 +302,15 @@ result = ask("what tech stack did Prakarsh use")
 
 ## Streamlit UI (`app.py`)
 
+> Being replaced in Phase 3 by the Django + HTML/JS stack. Documented here as the current working UI.
+
 Chat interface at `http://localhost:8501`. Per turn:
 
-1. Detect source filter and numeric intent.
-2. Run hybrid retrieval (table-biased when numeric).
-3. Render: an optional caption ("Filtered to: …" and/or "Numeric intent → table-biased retrieval"), the answer (Markdown), and an expandable **Sources** panel. Table chunks render as actual Markdown tables; text chunks render as raw text. Each source row is tagged 📄 TEXT or 📊 TABLE.
+1. Rewrite the question against history, detect source filter(s) and numeric/figure/board/statement intent.
+2. Run hybrid retrieval with the relevant intent bonuses.
+3. Render: an optional flags caption (`Rewrote → …`, `Filtered to: …`, `Multi-author → …`, `Numeric intent → table-biased retrieval`), the answer (Markdown), and an expandable **Sources** panel. Table chunks render as actual Markdown tables; text chunks render as raw text. Each source row is tagged 📄 TEXT, 📊 TABLE, or 🖼️ FIGURE.
 
-Session history is kept in `st.session_state.history` for the duration of the tab.
+The sidebar has a **🗑️ New chat** button and a message-count caption (stored vs. sent — "last N sent to model (~M Q&A pairs)"). Session history is kept in `st.session_state.history` for the duration of the tab and trimmed to `HISTORY_TURNS` before being passed to `ask()`. This per-tab, in-RAM history is exactly what Phase 3 moves into a database (`Chat` / `Message` tables) for persistent, multi-chat history.
 
 Run:
 ```bash
@@ -303,7 +341,7 @@ A small YAML-driven harness so retrieval, filter detection, and answer quality c
 
 ```bash
 python evals/run.py --retrieval   # ~1s total; scores retrieval + filter + numeric only. Use during dev.
-python evals/run.py               # full run with LLM (~10-15 min on llama3.1:8b)
+python evals/run.py               # full run with LLM (cloud gpt-oss is fast; local 8B models ~10-15 min)
 python evals/run.py --case 6      # single case for debugging
 ```
 
@@ -324,10 +362,15 @@ The current suite (11 cases) covers: author-filter single-doc lookups, the OCR p
   ```
 - Ollama installed and running:
   ```bash
-  ollama pull llama3.1:8b
   ollama pull nomic-embed-text
   ollama pull granite3.2-vision:2b   # optional, only for figure descriptions
   ollama serve   # usually runs as a background service on install
+
+  # Chat LLM — pick ONE:
+  ollama signin                       # then use the cloud model (default, light on RAM)
+  #   LLM_MODEL = "gpt-oss:20b-cloud"
+  # or, fully offline:
+  ollama pull llama3.1:8b             # set LLM_MODEL = "llama3.1:8b" in config.py
   ```
 - Python deps:
   ```bash
@@ -380,13 +423,14 @@ python query.py "your question here"
 
 ## Known limitations
 
-- **No conversational memory** — each question is answered from retrieval alone; follow-ups like "and what about the second one" won't resolve coreferences.
+- **Memory is per-tab and in-RAM (Streamlit).** Conversational memory works (query rewriter + history placeholder), but history lives in `st.session_state` and dies on refresh — no persistent or multiple saved chats. Phase 3 (Django + DB) addresses this.
 - **No cross-encoder re-ranker.** The ensemble is unweighted RRF; for highly competitive numeric queries a re-ranker (e.g. `bge-reranker-base`) could push the right chunk to position 1. Not added until eval shows the need.
 - **Single-collection index.** All PDFs live in one Chroma collection; per-document or per-domain collections would help if the corpus grows past a few hundred files.
 - **BM25 corpus is loaded into memory.** Fine at this scale (hundreds of chunks); would need rework for tens of thousands.
 - **Camelot stream is noisier than pdfplumber.** It happily produces "tables" out of multi-column body text. We filter by `TABLE_MIN_ROWS` / `TABLE_MIN_COLS` and stash an `table_engine` metadata field so noisy chunks can be down-weighted later if needed.
 - **img2table quality depends on scan resolution.** Tables on low-DPI or skewed scans may be partially reconstructed; tuning `OCR_DPI` upward (and adding deskew/binarise pre-processing) helps.
-- **Figure-question answers are limited by llama3.1:8b.** The vision pipeline correctly generates and retrieves figure descriptions (rank #1 for figure-intent queries, with an "AUTHORITATIVE TRANSCRIPTION" framing in the prompt) — but llama3.1:8b often refuses to synthesise from them, falling back to inference from surrounding text. This is a known small-model instruction-following weakness; swapping in a stronger chat LLM fixes it without any code change.
+- **Figure-question answer quality is model-dependent.** The vision pipeline correctly generates and retrieves figure descriptions (rank #1 for figure-intent queries, with an "AUTHORITATIVE TRANSCRIPTION" framing in the prompt). Small local models like `llama3.1:8b` often refuse to synthesise from them and fall back to inference from surrounding text; the larger `gpt-oss:20b-cloud` handles them correctly. This is a model-class limitation, not a pipeline bug — no code change is needed to fix it, just a stronger chat LLM.
+- **Cloud LLM is not fully offline.** The default `gpt-oss:20b-cloud` sends prompts (retrieved context included) to Ollama Cloud. For a strictly on-prem deployment, switch `LLM_MODEL` to a local model — the rest of the pipeline is unchanged.
 
 ---
 
@@ -399,9 +443,9 @@ python query.py "your question here"
 | `0 non-empty pages` on a scanned PDF                   | Confirm `OCR_ENABLED=True` and Tesseract is on PATH. Check `OCR_MIN_CHARS` — it triggers OCR below this.     |
 | Entity question (company / proper noun) misses         | Hybrid BM25 should catch this. If not, check tokenization in `_bm25_tokenize` and confirm the chunk content actually contains the term (`vs.get(where={"source": "..."})`). |
 | Numeric question misses the right table                | Confirm `is_numeric_question()` returns True for the phrasing; if False, add a keyword to `_NUMERIC_KEYWORDS`. |
-| Model refuses on a clearly answerable question         | Re-check the prompt's "do not refuse on privacy grounds" line is intact; some llama3.1 phrasings still trigger residual safety behavior. Try rephrasing. |
+| Model refuses on a clearly answerable question         | Re-check the prompt's "do not refuse on privacy grounds" line is intact; some small local models still trigger residual safety behavior on certain phrasings. Try rephrasing or switch to `gpt-oss:20b-cloud`. |
 | Streamlit prompts for email on first run               | A `~/.streamlit/config.toml` with `headless = true` suppresses it.                                           |
 | Answers reference a PDF you've since removed           | Wipe `vectorstore/` and re-run `ingest.py`.                                                                  |
 | Retrieval returns boilerplate (cover, certificates)    | Increase `MMR_LAMBDA` toward 1.0 (more relevance) or lower it toward 0.0 (more diversity). Eval first.       |
 | `ingest_figures.py` hangs on one PDF                   | Per-call timeout (`VISION_TIMEOUT_SEC`) handles individual wedges. If the runner itself is stuck (`ollama ps` shows `Stopping...`), `kill -9` the script, restart Ollama, and rerun — already-done pages will be skipped. |
-| Figure answer in chat is generic ("no description")    | Retrieval is probably fine — check the Sources panel for a `🖼️ FIGURE` chunk. If it's there, the chat LLM (llama3.1:8b) is ignoring it; this is the documented small-model limitation, not a bug. |
+| Figure answer in chat is generic ("no description")    | Retrieval is probably fine — check the Sources panel for a `🖼️ FIGURE` chunk. If it's there but a small local model is ignoring it, that's the documented model-class limitation, not a bug; `gpt-oss:20b-cloud` handles figure synthesis correctly. |
