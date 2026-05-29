@@ -122,6 +122,11 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Serve the Phase B frontend (plain HTML/CSS/JS) straight from Django, so there
+# is one server and no CORS. In DEBUG, django.contrib.staticfiles auto-serves
+# files found under these dirs at /static/.
+STATICFILES_DIRS = [BASE_DIR / 'frontend']
+
 # Default primary-key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

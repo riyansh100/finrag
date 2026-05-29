@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FinRAG</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- LEFT: sidebar with chat list -->
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <h1>FinRAG</h1>
+        <button id="new-chat-btn" title="Start a new chat">+ New Query</button>
+      </div>
+      <ul id="chat-list"><!-- chats injected by app.js --></ul>
+      <div class="sidebar-foot">Local RAG · gpt-oss:20b</div>
+    </aside>
+
+    <!-- RIGHT: the active conversation -->
+    <main id="main">
+      <div id="messages">
+        <div class="empty-state" id="empty-state">
+          ◇ Select a query or start a new one to begin.
+        </div>
+        <!-- message bubbles injected by app.js -->
+      </div>
+
+      <form id="composer" autocomplete="off">
+        <input
+          id="question-input"
+          type="text"
+          placeholder="Query your documents..."
+          disabled
+        />
+        <button id="send-btn" type="submit" disabled>Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/static/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
