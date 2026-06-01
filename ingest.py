@@ -18,6 +18,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
 from embeddings import make_embeddings, make_vectorstore
+from parsers import PARSERS, parse_filename
 
 try:
     import pytesseract
@@ -76,8 +77,16 @@ def author_from_filename(name):
     return " ".join(expanded) if expanded else stem
 
 
-def _chunk_header(filename, author, page=None):
+def _chunk_header(filename, author, page=None, meta=None):
+    """Top-of-chunk header embedded INTO the text so it's part of the vector.
+    `meta` (from parsers.parse_filename) adds Company/Period lines for quarterlies
+    and annuals so the LLM can attribute facts to the right period."""
     lines = [f"Document: {filename}"]
+    if meta:
+        if meta.get("company"):
+            lines.append(f"Company: {meta['company'].title()}")
+        if meta.get("period"):
+            lines.append(f"Period: {meta['period']}")
     if author:
         lines.append(f"Author: {author}")
     if page is not None:
@@ -135,11 +144,15 @@ def _describe_page_with_vision(page):
 
 
 def _ocr_image(img):
+    """Best-effort OCR. Returns "" on ANY failure (binary, missing binary,
+    unicode decode error in pytesseract's stderr parser, etc.) — one bad page
+    must never abort a multi-PDF ingest."""
     if not _OCR_IMPORTS_OK:
         return ""
     try:
         return pytesseract.image_to_string(img, lang=config.OCR_LANG).strip()
-    except pytesseract.TesseractNotFoundError:
+    except Exception as e:
+        print(f"    [warn] OCR failed on page: {type(e).__name__}: {str(e)[:120]}")
         return ""
 
 
@@ -274,8 +287,15 @@ def _extract_img2table(png_bytes):
 
 # --- main per-PDF loader ---------------------------------------------------
 
-def load_pdf(path):
+def load_pdf(path, doc_meta=None):
+    """Load one PDF.
+
+    doc_meta: optional dict from parsers.parse_filename — merged into every
+              chunk's metadata (company/period/quarter/fy/doc_type). Pass None
+              for one-off files outside the per-company layout.
+    """
     author = author_from_filename(path.name)
+    doc_meta = doc_meta or {}
     doc = fitz.open(path)
 
     # Open pdfplumber for this PDF once (closed at the end). Tolerate failure.
@@ -304,9 +324,10 @@ def load_pdf(path):
 
         if text:
             text_docs.append(Document(
-                page_content=_chunk_header(path.name, author) + text,
+                page_content=_chunk_header(path.name, author, meta=doc_meta) + text,
                 metadata={"source": path.name, "author": author,
-                          "page": page_num, "type": "text", "ocr": used_ocr},
+                          "page": page_num, "type": "text", "ocr": used_ocr,
+                          **doc_meta},
             ))
             if used_ocr:
                 counts["ocr"] += 1
@@ -337,12 +358,13 @@ def load_pdf(path):
         for md, engine in page_tables:
             counts[engine] += 1
             table_docs.append(Document(
-                page_content=_chunk_header(path.name, author, page=page_num)
+                page_content=_chunk_header(path.name, author, page=page_num,
+                                           meta=doc_meta)
                              + title_line + md,
                 metadata={"source": path.name, "author": author,
                           "page": page_num, "type": "table",
                           "ocr": used_ocr, "table_engine": engine,
-                          "section": title},
+                          "section": title, **doc_meta},
             ))
 
         # Figure description (native pages only — OCR'd pages ARE images and
@@ -353,11 +375,13 @@ def load_pdf(path):
             desc = _describe_page_with_vision(page)
             if desc:
                 figure_docs.append(Document(
-                    page_content=_chunk_header(path.name, author, page=page_num)
+                    page_content=_chunk_header(path.name, author, page=page_num,
+                                               meta=doc_meta)
                                  + "Figure description:\n" + desc,
                     metadata={"source": path.name, "author": author,
                               "page": page_num, "type": "figure",
-                              "ocr": False, "vision_model": config.VISION_MODEL},
+                              "ocr": False, "vision_model": config.VISION_MODEL,
+                              **doc_meta},
                 ))
                 counts["figure"] += 1
 
@@ -369,15 +393,41 @@ def load_pdf(path):
 
 # --- driver ----------------------------------------------------------------
 
+def _discover_pdfs():
+    """Yield (path, company_folder, parsed_meta) for every PDF in data/.
+
+    Layout: data/<company>/*.pdf — one folder per company, parser registered
+    in parsers.PARSERS. Folders prefixed with "_" are skipped (e.g. _archive).
+    Stray PDFs at the top level of data/ are still ingested (no company meta).
+    """
+    items = []
+    for child in sorted(config.DATA_DIR.iterdir()):
+        if child.is_file() and child.suffix.lower() == ".pdf":
+            items.append((child, None, {}))
+            continue
+        if not child.is_dir() or child.name.startswith("_"):
+            continue
+        company = child.name
+        for pdf in sorted(child.glob("*.pdf")):
+            meta = parse_filename(company, pdf.name) or {}
+            items.append((pdf, company, meta))
+    return items
+
+
 def main():
-    pdf_paths = sorted(config.DATA_DIR.glob("*.pdf"))
-    if not pdf_paths:
+    items = _discover_pdfs()
+    if not items:
         print(f"No PDFs found in {config.DATA_DIR}. Drop some in and re-run.")
         sys.exit(1)
 
-    print(f"Found {len(pdf_paths)} PDF(s):")
-    for p in pdf_paths:
-        print(f"  - {p.name}")
+    print(f"Found {len(items)} PDF(s):")
+    for path, company, meta in items:
+        tag = f"  [{company}]" if company else "  [<root>]"
+        period = f" period={meta.get('period')}" if meta.get("period") else ""
+        print(f"{tag} {path.name}{period}")
+    if not any(company in PARSERS for _, company, _ in items):
+        print("  [warn] No PDFs matched a registered company folder; "
+              "add one to parsers.PARSERS to enable period metadata.")
 
     if config.OCR_ENABLED and not _OCR_IMPORTS_OK:
         print("  [warn] OCR enabled but pytesseract/Pillow missing.")
@@ -394,8 +444,8 @@ def main():
     table_docs_all = []
     figure_docs_all = []
     totals = {"ocr": 0, "plumber": 0, "stream": 0, "img2table": 0, "figure": 0}
-    for path in pdf_paths:
-        text_docs, table_docs, figure_docs, counts = load_pdf(path)
+    for path, _company, meta in items:
+        text_docs, table_docs, figure_docs, counts = load_pdf(path, doc_meta=meta)
         bits = [f"{len(text_docs)} text pages"]
         if counts["ocr"]:
             bits.append(f"{counts['ocr']} via OCR")
@@ -438,7 +488,19 @@ def main():
     embeddings = make_embeddings()
     print(f"Embedding + persisting to {config.VECTORSTORE_DIR} ...")
     vectorstore = make_vectorstore(embeddings=embeddings)
-    vectorstore.add_documents(chunks)
+    # Add in small batches so a transient Ollama hiccup mid-corpus doesn't
+    # discard everything that came before, and so we get visible progress.
+    BATCH = 64
+    for i in range(0, len(chunks), BATCH):
+        batch = chunks[i:i + BATCH]
+        try:
+            vectorstore.add_documents(batch)
+            print(f"  embedded {i + len(batch)}/{len(chunks)} "
+                  f"(total in DB: {vectorstore._collection.count()})",
+                  flush=True)
+        except Exception as e:
+            print(f"  [warn] batch {i}-{i + len(batch)} failed: "
+                  f"{type(e).__name__}: {str(e)[:160]}", flush=True)
     print(f"Done. Collection '{config.COLLECTION_NAME}' now has "
           f"{vectorstore._collection.count()} vectors "
           f"(cosine similarity, nomic task-prefixed).")
