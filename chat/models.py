@@ -50,6 +50,11 @@ class Message(models.Model):
     sources = models.JSONField(default=list, blank=True)
     # flags: strings like "Rewrote -> ...", "Filtered to: ...", "Numeric intent".
     flags = models.JSONField(default=list, blank=True)
+    # The mode this turn was answered in ("extract" | "analyze" | "compare").
+    # Blank for user turns; set for assistants and saved with the message so a
+    # chat can show per-turn mode badges and the composer can default to "the
+    # last mode used in this chat".
+    mode = models.CharField(max_length=20, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
 

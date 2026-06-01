@@ -51,22 +51,37 @@ def _build_flags(result):
             "Multi-author → per-author retrieval bonus: "
             + ", ".join(result["multi_sources"])
         )
+    if result.get("company_filter"):
+        flags.append(f"Company → {result['company_filter']}")
+    if result.get("companies"):
+        flags.append("Multi-company → " + ", ".join(result["companies"]))
+    if result.get("period_filter"):
+        flags.append(f"Period → {result['period_filter']}")
+    if result.get("periods"):
+        flags.append("Period range → " + ", ".join(result["periods"]))
     if result.get("numeric"):
         flags.append("Numeric intent → table-biased retrieval")
     return flags
 
 
-def run_query(question, history):
+def run_query(question, history, mode=None):
     """Call the RAG pipeline and return JSON-able pieces.
 
     history: list of {"role", "content"} for THIS chat, already trimmed and
              NOT including the current question.
-    Returns: {"answer", "sources", "flags", "rewritten_query"}.
+    mode: optional mode id ("extract" | "analyze" | "compare"). When set, the
+          shared cached LLM is NOT reused — ask() builds a per-mode LLM so
+          temperature/prompt match the mode.
+    Returns: {"answer", "sources", "flags", "mode", "rewritten_query"}.
     """
-    result = _ask(question, history=history, llm=get_llm())
+    if mode:
+        result = _ask(question, history=history, mode=mode)
+    else:
+        result = _ask(question, history=history, llm=get_llm())
     return {
         "answer": result["answer"],
         "sources": [_doc_to_dict(d) for d in result["sources"]],
         "flags": _build_flags(result),
+        "mode": result.get("mode"),
         "rewritten_query": result.get("rewritten_query"),
     }

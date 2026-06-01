@@ -20,6 +20,7 @@ from langchain_classic.retrievers.ensemble import EnsembleRetriever
 import config
 from ingest import author_from_filename
 from embeddings import make_vectorstore
+from modes import DEFAULT_MODE, get_mode
 
 
 SYSTEM_PROMPT = """You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
@@ -105,21 +106,35 @@ def _all_docs():
     return _CORPUS
 
 
-def _filter_corpus(source_filter=None, type_filter=None):
+def _filter_corpus(source_filter=None, type_filter=None,
+                   company_filter=None, period_filter=None, fy_filter=None):
     docs = _all_docs()
     if source_filter:
         docs = [d for d in docs if d.metadata.get("source") == source_filter]
     if type_filter:
         docs = [d for d in docs if d.metadata.get("type") == type_filter]
+    if company_filter:
+        docs = [d for d in docs if d.metadata.get("company") == company_filter]
+    if period_filter:
+        docs = [d for d in docs if d.metadata.get("period") == period_filter]
+    if fy_filter is not None:
+        docs = [d for d in docs if d.metadata.get("fy") == fy_filter]
     return docs
 
 
-def _compose_filter(source_filter=None, type_filter=None):
+def _compose_filter(source_filter=None, type_filter=None,
+                    company_filter=None, period_filter=None, fy_filter=None):
     clauses = []
     if source_filter:
         clauses.append({"source": source_filter})
     if type_filter:
         clauses.append({"type": type_filter})
+    if company_filter:
+        clauses.append({"company": company_filter})
+    if period_filter:
+        clauses.append({"period": period_filter})
+    if fy_filter is not None:
+        clauses.append({"fy": fy_filter})
     if not clauses:
         return None
     if len(clauses) == 1:
@@ -127,13 +142,15 @@ def _compose_filter(source_filter=None, type_filter=None):
     return {"$and": clauses}
 
 
-def _vector_retriever(k, source_filter=None, type_filter=None):
+def _vector_retriever(k, source_filter=None, type_filter=None,
+                      company_filter=None, period_filter=None, fy_filter=None):
     search_kwargs = {
         "k": k,
         "fetch_k": max(config.MMR_FETCH_K, k * 3),
         "lambda_mult": config.MMR_LAMBDA,
     }
-    flt = _compose_filter(source_filter, type_filter)
+    flt = _compose_filter(source_filter, type_filter, company_filter,
+                          period_filter, fy_filter)
     if flt:
         search_kwargs["filter"] = flt
     return _build_vectorstore().as_retriever(search_type="mmr", search_kwargs=search_kwargs)
@@ -145,10 +162,15 @@ def _bm25_tokenize(text):
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
-def _hybrid_retrieve(question, k, source_filter=None, type_filter=None):
+def _hybrid_retrieve(question, k, source_filter=None, type_filter=None,
+                     company_filter=None, period_filter=None, fy_filter=None):
     """BM25 + vector ensemble with reciprocal rank fusion (LangChain EnsembleRetriever)."""
-    vec = _vector_retriever(k=k, source_filter=source_filter, type_filter=type_filter)
-    bm25_corpus = _filter_corpus(source_filter=source_filter, type_filter=type_filter)
+    vec = _vector_retriever(k=k, source_filter=source_filter, type_filter=type_filter,
+                            company_filter=company_filter, period_filter=period_filter,
+                            fy_filter=fy_filter)
+    bm25_corpus = _filter_corpus(source_filter=source_filter, type_filter=type_filter,
+                                 company_filter=company_filter, period_filter=period_filter,
+                                 fy_filter=fy_filter)
     if not bm25_corpus:
         return vec.invoke(question)
     bm25 = BM25Retriever.from_documents(bm25_corpus, preprocess_func=_bm25_tokenize)
@@ -215,6 +237,167 @@ def detect_source_filter(question, *extra_questions):
     else None. Multi-question form lets the caller include the rewritten query."""
     matched = detect_all_sources(question, *extra_questions)
     return next(iter(matched)) if len(matched) == 1 else None
+
+
+# --- company / period intent (financial corpora) ----------------------------
+
+# Token (lowercase, alpha-only) -> canonical company slug stored in metadata.
+# Aliases let "reliance", "riil", "rel industrial" all resolve to "riil".
+# Multi-word aliases are matched as substrings on the full question text.
+_COMPANY_TOKEN_ALIASES = {
+    "infosys": "infosys",
+    "infy": "infosys",
+    "riil": "riil",
+    "reliance": "riil",
+}
+_COMPANY_PHRASE_ALIASES = [
+    ("reliance industrial infrastructure", "riil"),
+    ("reliance industrial", "riil"),
+    ("rel industrial", "riil"),
+    ("reliance infra", "riil"),
+]
+
+
+def detect_all_companies(*questions):
+    """Return the set of company slugs mentioned in any of the question strings."""
+    matched = set()
+    for q in questions:
+        if not q:
+            continue
+        ql = q.lower()
+        for phrase, slug in _COMPANY_PHRASE_ALIASES:
+            if phrase in ql:
+                matched.add(slug)
+        for t in re.findall(r"[a-z]+", ql):
+            if t in _COMPANY_TOKEN_ALIASES:
+                matched.add(_COMPANY_TOKEN_ALIASES[t])
+    return matched
+
+
+def detect_company_filter(question, *extra_questions):
+    """Return the single company slug if exactly one is named, else None.
+    Multi-company questions fall back to no filter (hybrid retrieval handles them)."""
+    matched = detect_all_companies(question, *extra_questions)
+    return next(iter(matched)) if len(matched) == 1 else None
+
+
+# Period detection. Accepts the common writings analysts use:
+#   Q3FY24, Q3 FY24, Q3 FY2024, Q3 of FY24, Q3 2024, Q3-2024, Q3/2024,
+#   "third quarter of FY24"/"of 2024", FY24 / FY 2024 / FY 24-25 (annual).
+_Q_WORD = {"first": 1, "second": 2, "third": 3, "fourth": 4}
+
+_QUARTER_PATTERNS = [
+    # Q3FY24 / Q3 FY24 / Q3 FY2024
+    re.compile(r"\bq([1-4])\s*(?:of\s+)?fy\s*(\d{2,4})\b", re.IGNORECASE),
+    # Q3 2024 / Q3-2024 / Q3/2024
+    re.compile(r"\bq([1-4])\s*[-/ ]\s*(\d{4})\b", re.IGNORECASE),
+    # third quarter of FY24 / third quarter of 2024
+    re.compile(r"\b(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(?:fy\s*)?(\d{2,4})\b",
+               re.IGNORECASE),
+]
+
+_ANNUAL_PATTERNS = [
+    re.compile(r"\bfy\s*(\d{2,4})(?:\s*[-/]\s*\d{2,4})?\b", re.IGNORECASE),
+]
+
+
+def _normalize_fy(year_str):
+    """'24' -> 24, '2024' -> 24, '2025' -> 25.  For year-only forms the trailing
+    two digits ARE the FY (matches our filename convention: q1-2026.pdf = FY26)."""
+    y = int(year_str)
+    return y if y < 100 else y % 100
+
+
+def detect_periods(*questions):
+    """Return the set of canonical period labels (e.g. {'Q3FY24'}, {'FY25'},
+    {'Q1FY25','Q2FY25'}) the question mentions. Quarterly hits take precedence
+    over a same-year annual mention so 'Q3 FY24' doesn't also yield 'FY24'."""
+    periods = set()
+    quarterly_fys = set()
+    for q in questions:
+        if not q:
+            continue
+        for pat in _QUARTER_PATTERNS:
+            for m in pat.finditer(q):
+                qn_raw = m.group(1)
+                qn = int(qn_raw) if qn_raw.isdigit() else _Q_WORD[qn_raw.lower()]
+                fy = _normalize_fy(m.group(2))
+                periods.add(f"Q{qn}FY{fy:02d}")
+                quarterly_fys.add(fy)
+        for pat in _ANNUAL_PATTERNS:
+            for m in pat.finditer(q):
+                fy = _normalize_fy(m.group(1))
+                if fy not in quarterly_fys:
+                    periods.add(f"FY{fy:02d}")
+    return periods
+
+
+def detect_period_filter(question, *extra_questions):
+    """Single canonical period if exactly one is named, else None.
+    Multi-period questions (ranges, trends) are handled by fan-out in retrieve()."""
+    periods = detect_periods(question, *extra_questions)
+    return next(iter(periods)) if len(periods) == 1 else None
+
+
+# Range expansion. When the user writes "from X to Y" / "between X and Y" /
+# "X through Y" / "X vs Y" / "across X to Y", expand to the CLOSED interval so
+# every intervening period gets a fan-out slot. Without this, "FY24 to FY26"
+# only pulls FY24 + FY26 and silently drops FY25.
+_RANGE_CONNECTOR_RE = re.compile(
+    r"\b(from|to|through|across|between|vs\.?|versus|till|until)\b",
+    re.IGNORECASE,
+)
+
+_PERIOD_LABEL_RE = re.compile(r"^(?:Q([1-4]))?FY(\d{2})$")
+
+
+def _parse_period_label(label):
+    """'Q3FY24' -> ('quarterly', 24, 3); 'FY25' -> ('annual', 25, None); else None."""
+    m = _PERIOD_LABEL_RE.match(label or "")
+    if not m:
+        return None
+    q = int(m.group(1)) if m.group(1) else None
+    fy = int(m.group(2))
+    return ("quarterly" if q else "annual", fy, q)
+
+
+def expand_period_range(periods, *questions):
+    """If a range connector ("from X to Y", "between X and Y", "X through Y",
+    "X vs Y") is present AND exactly two same-granularity periods are detected,
+    return the closed interval. Otherwise return periods unchanged.
+
+    Quarterly intervals enumerate Q1->Q4 across years (cap at 16 to avoid
+    runaway fan-out on absurd ranges). Annual intervals enumerate years.
+    Mixed granularity (e.g. Q3FY24 + FY26) is NOT expanded — left to the user
+    to phrase consistently."""
+    if not periods or len(periods) != 2:
+        return periods
+    if not any(_RANGE_CONNECTOR_RE.search(q or "") for q in questions):
+        return periods
+    parsed = [_parse_period_label(p) for p in periods]
+    if not all(parsed):
+        return periods
+    parsed.sort()
+    kinds = {p[0] for p in parsed}
+    if len(kinds) != 1:
+        return periods
+    kind = kinds.pop()
+    out = set()
+    if kind == "annual":
+        for fy in range(parsed[0][1], parsed[1][1] + 1):
+            out.add(f"FY{fy:02d}")
+    else:  # quarterly
+        fy, q = parsed[0][1], parsed[0][2]
+        hi_fy, hi_q = parsed[1][1], parsed[1][2]
+        steps = 0
+        while (fy, q) <= (hi_fy, hi_q) and steps < 16:
+            out.add(f"Q{q}FY{fy:02d}")
+            q += 1
+            if q > 4:
+                q = 1
+                fy += 1
+            steps += 1
+    return out
 
 
 # --- numeric-intent detection ----------------------------------------------
@@ -342,6 +525,18 @@ def format_context(docs):
         src = d.metadata.get("source", "?")
         page = d.metadata.get("page", "?")
         kind = d.metadata.get("type", "text")
+        # Period / company are also surfaced here so EVERY chunk (including
+        # 2nd/3rd sub-chunks of a split page, which lose the in-text header)
+        # carries the attribution the LLM needs to answer period-scoped
+        # questions correctly.
+        company = d.metadata.get("company") or ""
+        period = d.metadata.get("period") or ""
+        attr_bits = [f"{src} p.{page}"]
+        if company:
+            attr_bits.append(company)
+        if period:
+            attr_bits.append(period)
+        attr = " · ".join(attr_bits)
         tag = {"table": "TABLE", "figure": "FIGURE"}.get(kind, "TEXT")
         body = _normalize_indian_numbers(d.page_content)
         if kind == "figure":
@@ -353,7 +548,7 @@ def format_context(docs):
                 "this figure, draw your answer directly from the text below; do NOT "
                 "say the figure is missing or only described.)\n\n" + body
             )
-        parts.append(f"[{i}] ({src} p.{page}) [{tag}]\n{body}")
+        parts.append(f"[{i}] ({attr}) [{tag}]\n{body}")
     return "\n\n".join(parts)
 
 
@@ -370,17 +565,153 @@ def _dedupe(docs):
     return out
 
 
+# Currency disambiguation -- Infosys quarterly press releases publish the
+# statement of comprehensive income TWICE: once in INR (page 3) and once in
+# USD (page 4). Both pages embed nearly identical labels ("Revenue", "Cost of
+# Sales", ...) so they rank equally on similarity, then the model mixes
+# crore-scale and million-scale values and produces nonsense. Detect each
+# chunk's reporting unit from the table header it carries and stable-sort the
+# final list INR-first, so the MAX_CONTEXT_CHUNKS cap demotes USD pages first.
+# This keeps the USD content available when it's the only thing that matched,
+# but never lets it crowd out the INR version of the same statement.
+_USD_MARKERS = ("in us $", "in us$", "us$ millions", "us $ millions",
+                "(in usd", "(in us $", "(in us$",
+                "statement of comprehensive income\n(in us")
+_INR_MARKERS = ("in ₹ crore", "in ` crore", "in rs. crore", "in rs crore",
+                "(in ₹", "(in `", "₹ crore", "rs. crore",
+                "(in inr")
+
+
+_USD_PER_SHARE_RE = re.compile(r"\beps\s*\(\$\)", re.IGNORECASE)
+_INR_PER_SHARE_RE = re.compile(r"\beps\s*\(\s*(?:₹|`|rs\.?)\s*\)", re.IGNORECASE)
+_DOLLAR_VALUE_RE = re.compile(r"\$\s?\d")
+
+
+def _doc_currency(doc):
+    """Classify a chunk as 'inr' | 'usd' | None.
+
+    Tries three signals in order so we still classify sub-chunks where the
+    "(In ₹ crore...)" caption was split away by the text splitter:
+      1. Explicit unit caption in the chunk head ("(In ₹ crore...)" / "(in US $ millions)").
+      2. "EPS (₹)" vs "EPS ($)" — appears once per statement at the bottom and
+         tends to survive splitting alongside the totals rows.
+      3. $-prefixed values anywhere ('$ 4,663') as a USD tiebreaker.
+    Conservative — anything ambiguous stays None and lands in the middle of
+    the ordering, never the back."""
+    text = doc.page_content
+    head = text[:600].lower()
+    if any(m in head for m in _USD_MARKERS):
+        return "usd"
+    if any(m in head for m in _INR_MARKERS):
+        return "inr"
+    if _USD_PER_SHARE_RE.search(text):
+        return "usd"
+    if _INR_PER_SHARE_RE.search(text):
+        return "inr"
+    if _DOLLAR_VALUE_RE.search(text):
+        return "usd"
+    return None
+
+
+def _prefer_inr(docs):
+    """Stable reorder: INR first, unknown next, USD last."""
+    inr, unk, usd = [], [], []
+    for d in docs:
+        c = _doc_currency(d)
+        (inr if c == "inr" else usd if c == "usd" else unk).append(d)
+    return inr + unk + usd
+
+
 # --- main entry -------------------------------------------------------------
 
-def retrieve(question, source_filter=None, multi_sources=None):
+def _period_label_to_filter_kwargs(label):
+    """Convert a period label ('Q3FY24' or 'FY24') into the kwargs that should
+    be passed to the filtered retrievers.
+
+    Quarterlies map to an exact `period_filter` (chunks tag matches 1:1).
+    Annuals map to a numeric `fy_filter` instead, because the corpus has
+    quarterly chunks tagged Q*FY24 (not FY24) and we want them to match an
+    "FY24" mention. This also lets a single "FY24" range bucket pick up the
+    full-year column that sometimes appears inside a quarterly report."""
+    parsed = _parse_period_label(label)
+    if not parsed:
+        return {"period_filter": label}
+    kind, fy, _ = parsed
+    if kind == "annual":
+        return {"fy_filter": fy}
+    return {"period_filter": label}
+
+
+def retrieve(question, source_filter=None, multi_sources=None,
+             company_filter=None, period_filter=None, periods=None,
+             top_k=None):
     """Hybrid (BM25 + vector) retrieval with type / multi-source biasing.
 
     multi_sources: iterable of filenames. When set, retrieval is RESTRICTED to
         those sources (no corpus-wide fallback) so unrelated authors can't
         leak into the comparison context.
+    company_filter / period_filter: hard filters applied to BOTH BM25 and vector
+        when exactly one company / period is detected. These are passed through
+        to every hybrid call below.
+    periods: iterable of period labels for range/trend questions ("Q1FY25
+        through Q3FY26"). When set, retrieval fans out one pass per period and
+        merges, so every period in the range gets seats in the context.
+    top_k: optional override for config.TOP_K — modes like analyze/compare use
+        this to pull a larger base context.
     """
+    top_k = top_k or config.TOP_K
     numeric = is_numeric_question(question)
     figure = is_figure_question(question)
+
+    # Multi-period fan-out comes FIRST: ranges/trends span periods, so we want
+    # an equal slice per period rather than letting hybrid pick the most
+    # textually-similar one (which tends to mean a single period dominates).
+    if periods and len(periods) >= 2 and not period_filter:
+        docs = []
+        anchor_docs = []
+        k_per = max(3, top_k // len(periods) + 2)
+        # Anchor probe: the consolidated statement of operations in INR is the
+        # page that holds revenue / cost / operating profit / net profit /
+        # EPS for the quarter. We pick the BEST anchor chunk per period and
+        # promote it to the front of the context so MAX_CONTEXT_CHUNKS can't
+        # drop the actual figures page when fan-out is heavy.
+        anchor_probe = (
+            "Revenues Cost of Sales Gross profit Operating profit "
+            "Net profit Basic EPS in rupees crore"
+        )
+        for p in periods:
+            p_kwargs = _period_label_to_filter_kwargs(p)
+            docs += _hybrid_retrieve(question, k=k_per,
+                                     source_filter=source_filter,
+                                     company_filter=company_filter,
+                                     **p_kwargs)
+            if numeric:
+                docs += _hybrid_retrieve(question, k=max(2, k_per // 2),
+                                         source_filter=source_filter,
+                                         company_filter=company_filter,
+                                         type_filter="table", **p_kwargs)
+                # Per-period anchor: pull table chunks, prefer INR, and pick
+                # the FIRST one whose content shows the "Revenues" row from
+                # the statement of comprehensive income. One guaranteed slot
+                # per period.
+                cand = _hybrid_retrieve(anchor_probe, k=6,
+                                        source_filter=source_filter,
+                                        company_filter=company_filter,
+                                        type_filter="table", **p_kwargs)
+                cand = _prefer_inr(cand)
+                picked = None
+                for d in cand:
+                    if "Revenues" in d.page_content and "Operating profit" in d.page_content:
+                        picked = d
+                        break
+                if picked is None and cand:
+                    picked = cand[0]
+                if picked is not None:
+                    anchor_docs.append(picked)
+        # Anchors first so they survive the MAX_CONTEXT_CHUNKS cap, then the
+        # rest of the fan-out hits in INR-preferred order.
+        ordered = _dedupe(anchor_docs) + _prefer_inr(_dedupe(docs))
+        return _dedupe(ordered)[:config.MAX_CONTEXT_CHUNKS], numeric
 
     if multi_sources and not source_filter:
         # Multi-author comparison: per-source pull only, equal seats each.
@@ -406,6 +737,16 @@ def retrieve(question, source_filter=None, multi_sources=None):
                                          source_filter=src, type_filter="figure")
         return _dedupe(docs), numeric
 
+    # From here down: standard single-target retrieval. company_filter and
+    # period_filter (when set) are forwarded to every hybrid call so the
+    # statement / board / type bonuses and the base all stay scoped to the
+    # named company/period. Annual single-period filters are converted to a
+    # numeric fy filter so they match the quarterly chunks of that FY.
+    flt = {"source_filter": source_filter,
+           "company_filter": company_filter}
+    if period_filter:
+        flt.update(_period_label_to_filter_kwargs(period_filter))
+
     # Single-source or unfiltered path. Ordered by priority — most important
     # bonus first, because the total is capped at MAX_CONTEXT_CHUNKS.
 
@@ -417,7 +758,7 @@ def retrieve(question, source_filter=None, multi_sources=None):
     statement_bonus = []
     for variant, statement in detect_statement_targets(question):
         probe = f"{variant or ''} {statement}".strip()
-        cand = _hybrid_retrieve(probe, k=config.TOP_K * 2, source_filter=source_filter)
+        cand = _hybrid_retrieve(probe, k=top_k * 2, **flt)
         target_pages = {(d.metadata.get("source"), d.metadata.get("page"))
                         for d in cand if _doc_matches_statement(d, variant, statement)}
         for src, pg in target_pages:
@@ -430,8 +771,7 @@ def retrieve(question, source_filter=None, multi_sources=None):
     #     which is dense with "director" mentions. Target the listing page.
     board_bonus = []
     if is_board_question(question):
-        cand = _hybrid_retrieve(_BOARD_PROBE, k=config.TOP_K,
-                                source_filter=source_filter)
+        cand = _hybrid_retrieve(_BOARD_PROBE, k=top_k, **flt)
         # Prefer pages that actually LIST roles (high count of role labels).
         def role_score(d):
             t = d.page_content.lower()
@@ -447,16 +787,16 @@ def retrieve(question, source_filter=None, multi_sources=None):
     # 2. Type bias.
     type_bonus = []
     if numeric:
-        type_bonus += _hybrid_retrieve(question, k=max(1, config.TOP_K // 2),
-                                       source_filter=source_filter, type_filter="table")
+        type_bonus += _hybrid_retrieve(question, k=max(1, top_k // 2),
+                                       type_filter="table", **flt)
     if figure:
-        type_bonus += _hybrid_retrieve(question, k=max(1, config.TOP_K // 2),
-                                       source_filter=source_filter, type_filter="figure")
+        type_bonus += _hybrid_retrieve(question, k=max(1, top_k // 2),
+                                       type_filter="figure", **flt)
 
     # 3. General hybrid base.
-    base = _hybrid_retrieve(question, k=config.TOP_K, source_filter=source_filter)
+    base = _hybrid_retrieve(question, k=top_k, **flt)
 
-    docs = _dedupe(statement_bonus + board_bonus + type_bonus + base)[:config.MAX_CONTEXT_CHUNKS]
+    docs = _prefer_inr(_dedupe(statement_bonus + board_bonus + type_bonus + base))[:config.MAX_CONTEXT_CHUNKS]
     return docs, numeric
 
 
@@ -491,18 +831,42 @@ def rewrite_query(question, history, llm=None):
     return rewritten or question
 
 
-def ask(question, history=None, llm=None):
+def ask(question, history=None, llm=None, mode=None):
     """Run one RAG turn.
 
     Args:
         question: the user's raw input.
         history: optional list of prior turns [{"role": ..., "content": ...}, ...].
-        llm: optional pre-built ChatOllama (used for tests/reuse).
+        llm: optional pre-built ChatOllama (used for tests/reuse). NOTE: when
+             mode is set, this is ignored in favour of a per-mode LLM so each
+             mode can use its own temperature.
+        mode: one of MODES keys ("extract", "analyze", "compare"). Defaults to
+              "extract" (current behavior). Picks the system prompt and per-mode
+              retrieval/LLM tuning.
 
-    Returns dict with answer, sources, filter, numeric flag, and rewritten_query.
+    Returns dict with answer, sources, filter info, numeric/period/company
+    flags, mode, and rewritten_query.
     """
     history = history or []
-    llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0)
+    mode_name = (mode or DEFAULT_MODE).lower()
+    mode_cfg = get_mode(mode_name)
+    # Per-mode LLM (lets analyze/compare use a different temperature later).
+    # If the caller passed an llm AND no explicit mode override, reuse it for
+    # backward compat; otherwise build a fresh one with the mode's temperature.
+    if llm is not None and mode is None:
+        pass  # use the caller's llm
+    else:
+        llm = ChatOllama(model=config.LLM_MODEL,
+                         base_url=config.OLLAMA_BASE_URL,
+                         temperature=mode_cfg["temperature"])
+
+    # Mode-specific prompt template. History placeholder + human turn match the
+    # original PROMPT layout exactly.
+    mode_prompt = ChatPromptTemplate.from_messages([
+        ("system", mode_cfg["system_prompt"]),
+        MessagesPlaceholder("history"),
+        ("human", "{question}"),
+    ])
 
     rewritten = rewrite_query(question, history, llm=llm)
     # Run filter detection over BOTH the original and the rewritten query so
@@ -510,11 +874,29 @@ def ask(question, history=None, llm=None):
     all_sources = detect_all_sources(question, rewritten)
     source_filter = next(iter(all_sources)) if len(all_sources) == 1 else None
     multi_sources = all_sources if len(all_sources) >= 2 else None
+
+    # Company/period intent (financial corpora). Exactly-one => hard filter;
+    # multiple/none => no filter (hybrid handles cross-company comparisons).
+    all_companies = detect_all_companies(question, rewritten)
+    company_filter = next(iter(all_companies)) if len(all_companies) == 1 else None
+    all_periods = detect_periods(question, rewritten)
+    # Range expansion: "from FY24 to FY26" -> {FY24, FY25, FY26}; "Q3 FY23 to
+    # Q3 FY24" -> {Q3FY23, Q4FY23, Q1FY24, Q2FY24, Q3FY24}. Endpoints-only
+    # questions ("X vs Y") are also expanded -- harmless if user truly meant
+    # just the endpoints, fan-out simply hits absent periods with no chunks.
+    all_periods = expand_period_range(all_periods, question, rewritten)
+    period_filter = next(iter(all_periods)) if len(all_periods) == 1 else None
+    periods_for_fanout = all_periods if len(all_periods) >= 2 else None
+
     docs, numeric = retrieve(rewritten, source_filter=source_filter,
-                             multi_sources=multi_sources)
+                             multi_sources=multi_sources,
+                             company_filter=company_filter,
+                             period_filter=period_filter,
+                             periods=periods_for_fanout,
+                             top_k=mode_cfg["top_k"])
     context = format_context(docs)
 
-    chain = PROMPT | llm | StrOutputParser()
+    chain = mode_prompt | llm | StrOutputParser()
     answer = chain.invoke({
         "context": context,
         "history": _history_to_messages(history),
@@ -527,6 +909,11 @@ def ask(question, history=None, llm=None):
         "multi_sources": sorted(multi_sources) if multi_sources else None,
         "numeric": numeric,
         "rewritten_query": rewritten if rewritten != question else None,
+        "company_filter": company_filter,
+        "period_filter": period_filter,
+        "periods": sorted(periods_for_fanout) if periods_for_fanout else None,
+        "companies": sorted(all_companies) if len(all_companies) >= 2 else None,
+        "mode": mode_name,
     }
 
 

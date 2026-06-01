@@ -12,7 +12,7 @@ from .models import Chat, Message
 class MessageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Message
-        fields = ["id", "role", "content", "sources", "flags", "created_at"]
+        fields = ["id", "role", "content", "sources", "flags", "mode", "created_at"]
         # Messages are created by the message endpoint (Step A5), never written
         # directly through this serializer.
         read_only_fields = fields

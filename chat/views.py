@@ -10,6 +10,7 @@ Endpoints (all under /api/):
 
 import config
 from django.shortcuts import get_object_or_404
+from modes import DEFAULT_MODE, MODES, list_modes
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -17,6 +18,13 @@ from rest_framework.response import Response
 from . import rag
 from .models import Chat, Message
 from .serializers import ChatDetailSerializer, ChatSerializer, MessageSerializer
+
+
+@api_view(["GET"])
+def mode_list(request):
+    """GET /api/modes -> [{id, label, description}, ...] plus the default.
+    Frontend uses this to populate the mode dropdown."""
+    return Response({"modes": list_modes(), "default": DEFAULT_MODE})
 
 
 @api_view(["GET", "POST"])
@@ -57,10 +65,17 @@ def message_create(request, chat_id):
     """
     chat = get_object_or_404(Chat, pk=chat_id)
 
-    question = (request.data or {}).get("question", "").strip()
+    body = request.data or {}
+    question = body.get("question", "").strip()
     if not question:
         return Response(
             {"detail": "Field 'question' is required and must be non-empty."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    mode = (body.get("mode") or DEFAULT_MODE).lower()
+    if mode not in MODES:
+        return Response(
+            {"detail": f"Unknown mode '{mode}'. Valid: {sorted(MODES)}"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -73,7 +88,7 @@ def message_create(request, chat_id):
 
     user_msg = Message.objects.create(chat=chat, role=Message.USER, content=question)
 
-    result = rag.run_query(question, history=prior)
+    result = rag.run_query(question, history=prior, mode=mode)
 
     assistant_msg = Message.objects.create(
         chat=chat,
@@ -81,6 +96,7 @@ def message_create(request, chat_id):
         content=result["answer"],
         sources=result["sources"],
         flags=result["flags"],
+        mode=result.get("mode") or mode,
     )
 
     # Auto-title a brand-new chat from its first question; touch updated_at so it
