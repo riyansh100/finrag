@@ -21,6 +21,7 @@ import config
 from ingest import author_from_filename
 from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
+import nlu
 
 
 SYSTEM_PROMPT = """You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
@@ -299,6 +300,33 @@ _QUARTER_PATTERNS = [
 _ANNUAL_PATTERNS = [
     re.compile(r"\bfy\s*(\d{2,4})(?:\s*[-/]\s*\d{2,4})?\b", re.IGNORECASE),
 ]
+
+# Free-standing quarter mention (e.g. "Q3 revenue from FY21 to FY26") where the
+# quarter is not bound to a year. Used to narrow an annual range to a single
+# quarter per year.
+_STANDALONE_QUARTER_RE = re.compile(
+    r"\bq([1-4])\b(?!\s*(?:of\s+)?(?:fy|\d))", re.IGNORECASE,
+)
+_STANDALONE_QUARTER_WORD_RE = re.compile(
+    r"\b(first|second|third|fourth)\s+quarter\b(?!\s+(?:of\s+)?(?:fy|\d))",
+    re.IGNORECASE,
+)
+
+
+def detect_standalone_quarter(*questions):
+    """Return 1..4 if the question names a quarter NOT already bound to a year
+    (the bound form is caught by _QUARTER_PATTERNS), else None. Used to narrow
+    an annual range to a single quarter per FY."""
+    for q in questions:
+        if not q:
+            continue
+        m = _STANDALONE_QUARTER_RE.search(q)
+        if m:
+            return int(m.group(1))
+        m = _STANDALONE_QUARTER_WORD_RE.search(q)
+        if m:
+            return _Q_WORD[m.group(1).lower()]
+    return None
 
 
 def _normalize_fy(year_str):
@@ -875,16 +903,28 @@ def ask(question, history=None, llm=None, mode=None):
     source_filter = next(iter(all_sources)) if len(all_sources) == 1 else None
     multi_sources = all_sources if len(all_sources) >= 2 else None
 
-    # Company/period intent (financial corpora). Exactly-one => hard filter;
-    # multiple/none => no filter (hybrid handles cross-company comparisons).
-    all_companies = detect_all_companies(question, rewritten)
+    # Company/period intent (financial corpora).
+    # PRIMARY: LLM structured extraction (handles paraphrases, typos, detached
+    #          tokens, relative dates -- things the regex can't reach).
+    # FALLBACK: regex detectors (fast, deterministic, used when the LLM call
+    #          fails, returns garbage, or extracts nothing actionable).
+    slots = nlu.extract_slots(f"{question}\n{rewritten}".strip())
+    if slots is not None:
+        all_companies = set(slots["companies"])
+        all_periods = nlu.slots_to_periods(slots)
+    else:
+        all_companies = detect_all_companies(question, rewritten)
+        all_periods = detect_periods(question, rewritten)
+        # Range expansion: "from FY24 to FY26" -> {FY24, FY25, FY26}; "Q3 FY23
+        # to Q3 FY24" -> {Q3FY23..Q3FY24}. Endpoints-only ("X vs Y") expand
+        # too -- harmless if the user meant just the endpoints.
+        all_periods = expand_period_range(all_periods, question, rewritten)
+        # "Q3 revenue from FY21 through FY26": free-standing Q3 isn't bound to
+        # any year, so narrow each FYxx -> Q3FYxx to actually target Q3 pages.
+        standalone_q = detect_standalone_quarter(question, rewritten)
+        if standalone_q and all_periods and all(p.startswith("FY") for p in all_periods):
+            all_periods = {f"Q{standalone_q}{p}" for p in all_periods}
     company_filter = next(iter(all_companies)) if len(all_companies) == 1 else None
-    all_periods = detect_periods(question, rewritten)
-    # Range expansion: "from FY24 to FY26" -> {FY24, FY25, FY26}; "Q3 FY23 to
-    # Q3 FY24" -> {Q3FY23, Q4FY23, Q1FY24, Q2FY24, Q3FY24}. Endpoints-only
-    # questions ("X vs Y") are also expanded -- harmless if user truly meant
-    # just the endpoints, fan-out simply hits absent periods with no chunks.
-    all_periods = expand_period_range(all_periods, question, rewritten)
     period_filter = next(iter(all_periods)) if len(all_periods) == 1 else None
     periods_for_fanout = all_periods if len(all_periods) >= 2 else None
 
