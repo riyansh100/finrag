@@ -373,6 +373,16 @@ def normalize_fact(
     }
 
 
+def _write_through_cache(fact_row) -> None:
+    """Best-effort write-through to the Redis L1. Local import keeps facts.py
+    importable without cache.py being loaded (and avoids a cycle)."""
+    try:
+        import cache
+        cache.write_through(fact_row)
+    except Exception as e:
+        print(f"  [facts] cache write-through skipped ({type(e).__name__}: {str(e)[:80]})")
+
+
 def persist_facts(normalized: list[dict], message=None) -> dict:
     """Upsert normalized facts into MetricFact and append to FactProvenance.
 
@@ -399,12 +409,15 @@ def persist_facts(normalized: list[dict], message=None) -> dict:
                 ).first()
 
                 if existing is None:
-                    MetricFact.objects.create(extracted_from=message, **f)
+                    new_row = MetricFact.objects.create(extracted_from=message, **f)
                     op = "insert"
                     counters["inserted"] += 1
+                    _write_through_cache(new_row)
                 elif existing.value == f["value"]:
                     op = "duplicate"
                     counters["duplicate"] += 1
+                    # Refresh TTL so frequently-confirmed facts don't expire.
+                    _write_through_cache(existing)
                 else:
                     # Snapshot the prior value, then overwrite.
                     FactProvenance.objects.create(
@@ -424,6 +437,7 @@ def persist_facts(normalized: list[dict], message=None) -> dict:
                     existing.save()
                     op = "overwrite"
                     counters["overwritten"] += 1
+                    _write_through_cache(existing)
 
                 # Always log to provenance (even duplicates -- useful for
                 # 'we saw the same number again from a different run').

@@ -14,3 +14,4 @@ img2table
 django
 djangorestframework
 django-cors-headers
+redis

@@ -22,6 +22,7 @@ from ingest import author_from_filename
 from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
 import nlu
+import cache as fact_cache
 
 
 SYSTEM_PROMPT = """You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
@@ -571,7 +572,8 @@ def format_context(docs):
         if period:
             attr_bits.append(period)
         attr = " · ".join(attr_bits)
-        tag = {"table": "TABLE", "figure": "FIGURE"}.get(kind, "TEXT")
+        tag = {"table": "TABLE", "figure": "FIGURE",
+               "cached_facts": "CACHED-FACTS"}.get(kind, "TEXT")
         body = _normalize_indian_numbers(d.page_content)
         if kind == "figure":
             # Framed so the LLM treats granite's output as authoritative content,
@@ -1062,12 +1064,67 @@ def ask(question, history=None, llm=None, mode=None):
     period_filter = next(iter(all_periods)) if len(all_periods) == 1 else None
     periods_for_fanout = all_periods if len(all_periods) >= 2 else None
 
-    docs, numeric = retrieve(rewritten, source_filter=source_filter,
-                             multi_sources=multi_sources,
-                             company_filter=company_filter,
-                             period_filter=period_filter,
-                             periods=periods_for_fanout,
-                             top_k=mode_cfg["top_k"])
+    # ----- Slice-2 fact cache --------------------------------------------
+    # Look up cached facts BEFORE retrieval. Two outcomes:
+    #   - Full coverage: the cache satisfies every requested cell, so we
+    #     skip RAG and let the LLM answer from the synthetic facts chunk
+    #     alone (plus a tiny per-source citation breadcrumb).
+    #   - Partial / none: inject whatever cached facts we have at the top
+    #     of context as authoritative supporting evidence, then run normal
+    #     retrieval for the rest.
+    # Cache lookup is fault-tolerant -- if anything fails we proceed with
+    # the original RAG-only path.
+    cached_facts = []
+    cache_short_circuit = False
+    cached_chunk = None
+    try:
+        slots_for_cache = {
+            "companies": sorted(all_companies),
+            "periods":   sorted(periods_for_fanout) if periods_for_fanout
+                         else ([period_filter] if period_filter else []),
+            "metrics":   nlu_metrics,
+            "statement": detect_statement_targets(question)[0][1]
+                         if detect_statement_targets(question) else "",
+        }
+        cached_facts = fact_cache.lookup_for_slots(slots_for_cache)
+        if cached_facts:
+            cached_chunk = fact_cache.format_facts_as_context_chunk(cached_facts)
+            if (config.FACT_CACHE_SHORTCIRCUIT_RAG
+                    and fact_cache.is_full_coverage(cached_facts, slots_for_cache)):
+                cache_short_circuit = True
+    except Exception as e:
+        print(f"  [cache] lookup failed ({type(e).__name__}: {str(e)[:80]}); RAG-only")
+        cached_facts, cached_chunk, cache_short_circuit = [], None, False
+
+    if cache_short_circuit:
+        # Skip the heavy retrieval. We still pull a tiny set of source pages
+        # (one per cited filename) so the LLM has the original chunk text on
+        # hand to quote from and the Sources panel isn't empty.
+        cited_docs = []
+        seen_pages = set()
+        for f in cached_facts:
+            key = (f.get("source_doc"), f.get("source_page"))
+            if not key[0] or key in seen_pages:
+                continue
+            seen_pages.add(key)
+            matches = [d for d in _all_docs()
+                       if d.metadata.get("source") == key[0]
+                       and d.metadata.get("page") == key[1]]
+            cited_docs.extend(matches[:2])  # cap per-page to keep context tight
+        docs = [cached_chunk] + cited_docs[:config.MAX_CONTEXT_CHUNKS - 1]
+        numeric = True  # cached facts are always numeric
+    else:
+        docs, numeric = retrieve(rewritten, source_filter=source_filter,
+                                 multi_sources=multi_sources,
+                                 company_filter=company_filter,
+                                 period_filter=period_filter,
+                                 periods=periods_for_fanout,
+                                 top_k=mode_cfg["top_k"])
+        # Inject cached facts at the very front when we have ANY hits. They
+        # take a single seat and the LLM uses them verbatim, eliminating
+        # reading errors on the cells we've already validated.
+        if cached_chunk is not None:
+            docs = [cached_chunk] + docs[:config.MAX_CONTEXT_CHUNKS - 1]
     context = format_context(docs)
 
     chain = mode_prompt | llm | StrOutputParser()
@@ -1107,6 +1164,10 @@ def ask(question, history=None, llm=None, mode=None):
         "companies": sorted(all_companies) if len(all_companies) >= 2 else None,
         "mode": mode_name,
         "slots": slots_out,
+        # Cache diagnostics so the frontend can render "served from cache"
+        # badges and we can track hit rate in logs.
+        "cache_hits":           len(cached_facts),
+        "cache_short_circuit":  cache_short_circuit,
     }
 
 

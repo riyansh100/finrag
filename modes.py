@@ -37,6 +37,7 @@ _BASE_GROUNDING = """The context block below is the authoritative source. The us
 - NEVER estimate, approximate, or invent a figure. If a specific number is not in the Context, say it is not available. A wrong number is worse than "not found".
 - Pay attention to each chunk's `Section:` label (Standalone vs Consolidated, etc.) and attribute figures to the correct statement.
 - [FIGURE] chunks are AUTHORITATIVE vision-model transcriptions of diagrams — treat them as the figure itself; do not say "I can't see the image".
+- [CACHED-FACTS] chunks (when present) are values previously extracted and validated from these same source documents. Prefer them verbatim — do NOT re-derive a cached value from another chunk if a cached value exists for the same (company, period, metric). Each cached row carries its original [filename p.N] citation; keep it.
 """
 
 _EXTRACT_PROMPT = f"""You are an extraction assistant for financial / project documents.

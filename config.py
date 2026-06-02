@@ -46,3 +46,14 @@ TOP_K = 8
 MMR_FETCH_K = 24
 MMR_LAMBDA = 0.7
 MAX_CONTEXT_CHUNKS = 24      # hard cap on chunks sent to the LLM per query
+
+# Analytics layer (Slice 2) -- MetricFact cache + Redis L1.
+# Redis is OPTIONAL. If unreachable the cache transparently falls back to
+# SQLite (chat.MetricFact). Set REDIS_URL="" to disable Redis entirely.
+REDIS_URL = "redis://localhost:6379/0"
+FACT_CACHE_TTL_SEC = 24 * 60 * 60   # 24h; PDFs don't change often
+FACT_CACHE_ENABLED = True
+# When the cache covers EVERY requested (company, period, metric) cell, skip
+# RAG entirely -- the LLM gets only the synthetic cached-facts chunk and a
+# tiny set of source pages for citation context. Saves a full vector search.
+FACT_CACHE_SHORTCIRCUIT_RAG = True

@@ -61,6 +61,13 @@ def _build_flags(result):
         flags.append("Period range → " + ", ".join(result["periods"]))
     if result.get("numeric"):
         flags.append("Numeric intent → table-biased retrieval")
+    # Slice-2 cache diagnostics.
+    if result.get("cache_short_circuit"):
+        flags.append(f"Cache → {result.get('cache_hits', 0)} fact(s) "
+                     f"covered the question; RAG skipped")
+    elif result.get("cache_hits"):
+        flags.append(f"Cache → {result['cache_hits']} fact(s) "
+                     f"augmented retrieval")
     return flags
 
 
