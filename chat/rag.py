@@ -68,6 +68,9 @@ def _build_flags(result):
     elif result.get("cache_hits"):
         flags.append(f"Cache → {result['cache_hits']} fact(s) "
                      f"augmented retrieval")
+    if result.get("recall"):
+        flags.append(f"Recall → {len(result['recall'])} prior analysis "
+                     f"match(es)")
     return flags
 
 
@@ -94,4 +97,6 @@ def run_query(question, history, mode=None):
         # Slots are passed downstream to the fact-extractor / analytics layer.
         # Not surfaced to the frontend.
         "slots": result.get("slots") or {},
+        # Slice-3: prior analyses with overlapping scope (already JSON-safe).
+        "recall": result.get("recall") or [],
     }

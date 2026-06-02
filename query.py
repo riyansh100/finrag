@@ -23,6 +23,7 @@ from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
 import nlu
 import cache as fact_cache
+import recall as analysis_recall
 
 
 SYSTEM_PROMPT = """You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
@@ -1151,6 +1152,16 @@ def ask(question, history=None, llm=None, mode=None):
         "metrics": nlu_metrics,
     }
 
+    # Slice-3 proactive recall: find past AnalysisNotes whose scope overlaps
+    # this question, so the frontend can surface "you asked this before".
+    # Runs AFTER the answer so a slow DB read can't delay the response; uses
+    # the same slot dict the cache uses, so scoping is consistent.
+    try:
+        recall_hits = analysis_recall.find_candidates(slots_out)
+    except Exception as e:
+        print(f"  [recall] surface failed ({type(e).__name__}: {str(e)[:120]})")
+        recall_hits = []
+
     return {
         "answer": answer,
         "sources": docs,
@@ -1168,6 +1179,10 @@ def ask(question, history=None, llm=None, mode=None):
         # badges and we can track hit rate in logs.
         "cache_hits":           len(cached_facts),
         "cache_short_circuit":  cache_short_circuit,
+        # Slice-3: prior analyses with overlapping scope. Empty list when no
+        # match clears the threshold. Frontend renders these in a "Related
+        # past analysis" panel above the new answer.
+        "recall":               recall_hits,
     }
 
 

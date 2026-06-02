@@ -16,10 +16,58 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 import facts as facts_pipeline
+import nlu
+import recall as analysis_recall
 
 from . import rag
-from .models import Chat, Message
+from .models import AnalysisNote, Chat, Message
 from .serializers import ChatDetailSerializer, ChatSerializer, MessageSerializer
+
+
+@api_view(["GET"])
+def recall_lookup(request):
+    """GET /api/recall?question=...  ->  {"recall": [...]}.
+
+    Pre-submit recall probe: the composer can call this as the user types
+    (debounced) to surface a "you asked this before" panel without having to
+    commit to a full RAG call. Uses the same NLU slot extractor as ask() so
+    the matching is consistent."""
+    question = (request.query_params.get("question") or "").strip()
+    if not question:
+        return Response({"recall": []})
+    # No history -- the pre-submit path is meant to be cheap and stateless.
+    slots = nlu.extract_slots(question, history=None) or {}
+    # extract_slots returns the raw slot shape (companies, quarters, fys, ...);
+    # we normalize to the (companies, periods, statement, metrics) shape the
+    # recall matcher expects.
+    from cache import _METRIC_KEYS_KNOWN  # noqa: F401 (just ensures lazy import)
+    from nlu import slots_to_periods
+    scope = {
+        "companies": list(slots.get("companies") or []),
+        "periods":   sorted(slots_to_periods(slots)) if slots else [],
+        "statement": "",
+        "metrics":   list(slots.get("metrics") or []),
+    }
+    hits = analysis_recall.find_candidates(scope)
+    return Response({"recall": hits, "scope": scope})
+
+
+@api_view(["GET"])
+def analysis_note_detail(request, note_id):
+    """GET /api/notes/{id}  ->  full body of one AnalysisNote.
+
+    The recall list ships only a 280-char preview to keep responses small.
+    Frontend hits this when the user expands a recall card."""
+    note = get_object_or_404(AnalysisNote, pk=note_id)
+    return Response({
+        "id":          note.id,
+        "message_id":  note.source_message_id,
+        "chat_id":     note.source_message.chat_id if note.source_message else None,
+        "mode":        note.mode,
+        "scope":       note.scope or {},
+        "body_md":     note.body_md,
+        "created_at":  note.created_at.isoformat(),
+    })
 
 
 @api_view(["GET"])
@@ -138,6 +186,11 @@ def message_create(request, chat_id):
             "user_message": MessageSerializer(user_msg).data,
             "assistant_message": MessageSerializer(assistant_msg).data,
             "rewritten_query": result["rewritten_query"],
+            # Slice-3: prior analyses with overlapping scope. List of
+            # {id, message_id, chat_id, mode, scope, score, created_at,
+            #  preview, body_length}. Empty when nothing matched. Frontend
+            # renders a "Related past analysis" panel when non-empty.
+            "recall": result.get("recall") or [],
         },
         status=status.HTTP_201_CREATED,
     )

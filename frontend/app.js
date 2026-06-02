@@ -56,6 +56,7 @@ const postMessage = (id, question, mode) =>
     method: "POST",
     body: JSON.stringify({ question, mode }),
   });
+const getNote = (id) => api(`/notes/${id}`);
 
 // --- mode dropdown -----------------------------------------------------------
 function populateModeSelect() {
@@ -182,6 +183,66 @@ function addMessage({ role, content, sources = [], flags = [], mode = "" }) {
   return msg;
 }
 
+// --- recall panel (Slice 3) --------------------------------------------------
+// Render above the assistant answer when the API returns related past
+// analyses (overlapping company + period + statement scope). Lets the user
+// see prior work and click "Re-ask" to refresh it against the current corpus.
+function renderRecallPanel(recall, originalQuestion) {
+  if (!recall || !recall.length) return null;
+  const panel = el("div", "recall-panel");
+
+  const head = el("div", "recall-head");
+  head.textContent = `↺ Related past analysis (${recall.length})`;
+  panel.appendChild(head);
+
+  recall.forEach((r) => {
+    const card = el("div", "recall-card");
+
+    const meta = el("div", "recall-meta");
+    const scopeBits = [];
+    if (r.scope?.companies?.length) scopeBits.push(r.scope.companies.join(", "));
+    if (r.scope?.periods?.length) scopeBits.push(r.scope.periods.join(", "));
+    if (r.scope?.statement) scopeBits.push(r.scope.statement);
+    const when = new Date(r.created_at).toLocaleString();
+    meta.textContent = `${scopeBits.join(" · ")} · ${r.mode} · ${when} · match ${(r.score * 100).toFixed(0)}%`;
+    card.appendChild(meta);
+
+    const preview = el("div", "recall-preview markdown");
+    preview.innerHTML = renderMarkdown(r.preview || "");
+    card.appendChild(preview);
+
+    // Lazy-expand to full body on demand (the API ships only 280 chars).
+    if (r.body_length > (r.preview || "").length) {
+      const moreBtn = el("button", "recall-action");
+      moreBtn.textContent = "Show full answer";
+      moreBtn.addEventListener("click", async () => {
+        moreBtn.disabled = true;
+        moreBtn.textContent = "Loading…";
+        try {
+          const full = await getNote(r.id);
+          preview.innerHTML = renderMarkdown(full.body_md || "");
+          moreBtn.remove();
+        } catch (e) {
+          moreBtn.textContent = "Error — retry";
+          moreBtn.disabled = false;
+        }
+      });
+      card.appendChild(moreBtn);
+    }
+
+    // Re-ask submits the ORIGINAL current question (not the past one) so the
+    // user gets a fresh answer using whatever new facts are in the cache /
+    // PDFs since the prior turn.
+    const refreshBtn = el("button", "recall-action primary");
+    refreshBtn.textContent = "Re-ask this question";
+    refreshBtn.addEventListener("click", () => sendQuestion(originalQuestion));
+    card.appendChild(refreshBtn);
+
+    panel.appendChild(card);
+  });
+  return panel;
+}
+
 function scrollToBottom() {
   const m = $("#messages");
   m.scrollTop = m.scrollHeight;
@@ -230,6 +291,10 @@ async function sendQuestion(question) {
   try {
     const res = await postMessage(activeChatId, question, mode);
     pending.remove();
+    // Recall first (above the new answer) so the user sees "we have prior
+    // work on this" before the new answer they're about to read.
+    const recallPanel = renderRecallPanel(res.recall, question);
+    if (recallPanel) $("#messages").appendChild(recallPanel);
     addMessage(res.assistant_message);
     await refreshSidebar();
   } catch (err) {
