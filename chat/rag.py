@@ -84,4 +84,7 @@ def run_query(question, history, mode=None):
         "flags": _build_flags(result),
         "mode": result.get("mode"),
         "rewritten_query": result.get("rewritten_query"),
+        # Slots are passed downstream to the fact-extractor / analytics layer.
+        # Not surfaced to the frontend.
+        "slots": result.get("slots") or {},
     }

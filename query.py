@@ -43,6 +43,7 @@ Rules:
 - In YOUR answer, always render numbers in clean standard form with comma separators and currency/unit, e.g. write "₹1,362 lakh" or "₹983 lakh" — NEVER reproduce the raw spaced form like "13 62" or "9 83" in your output.
 - When a statement provides a LABELED TOTAL or SUBTOTAL (e.g. "Net Cash Flow from Operating Activities", "Profit for the Year"), quote that stated value directly. Do NOT recompute totals by summing line items.
 - NEVER estimate, approximate, or guess a figure. If a specific number (e.g. standalone net profit) is not present in the Context, say it is not available — do not derive it with "≈" or "roughly". A wrong number is worse than "not found".
+- WHEN A VALUE IS MISSING, the only acceptable explanation is "not present in the retrieved context". DO NOT speculate about which filing it lives in, which quarter is missing, or why it wasn't included. Never write things like "the Q4 balance sheet isn't supplied" or "the annual report wasn't provided" — you do not know what is or isn't in the underlying corpus, only what is in the Context block above.
 - Pay attention to each chunk's `Section:` label (e.g. "Standalone Statement of Profit and Loss" vs "Consolidated..."). Attribute every figure to the correct statement based on that label.
 - When describing a figure, synthesise from the [FIGURE] chunk's content; quote specific labels/components it lists.
 - If the context truly lacks the answer, say so clearly and state what is missing. Do not invent numbers, names, dates, or figure contents.
@@ -59,11 +60,13 @@ PROMPT = ChatPromptTemplate.from_messages([
 
 REWRITE_SYSTEM = """You rewrite a user's follow-up question into a standalone search query.
 
-Rules:
-- Resolve pronouns and references using the chat history ("his", "it", "that one", "the second").
-- Preserve the original intent and keywords.
-- Output ONLY the rewritten query — no preamble, no explanation, no quotes.
-- If the question is already standalone, output it unchanged.
+HARD CONSTRAINTS (violations are bugs):
+- Resolve pronouns and back-references using the chat history ("his", "it", "that one", "the second").
+- DO NOT introduce entities, periods, companies, years, metrics, or topics that are absent from BOTH the follow-up and the chat history. No "FY26" if the user said FY24/FY25. No "stock price" if the user asked about the balance sheet.
+- DO NOT add keywords to "help" retrieval. Rewriting is for disambiguation only.
+- Preserve the original intent and entities exactly.
+- Output ONLY the rewritten query — no preamble, no explanation, no quotes, no keyword soup.
+- If the question is already standalone (no pronouns, names its own entities), output it UNCHANGED.
 
 Examples:
 History: "what is riyansh's project about" -> "Riyansh built a real-time market data backend"
@@ -72,7 +75,10 @@ Rewrite: what is riyansh sachdev's revenue from the project
 
 Follow-up: "summarize it"
 History: "describe vikhyat's methodology" -> "Vikhyat used the TRIGRS model..."
-Rewrite: summarize vikhyat's methodology"""
+Rewrite: summarize vikhyat's methodology
+
+Follow-up: "compare balance sheets of Q3 for FY24 and FY25"   (already standalone)
+Rewrite: compare balance sheets of Q3 for FY24 and FY25"""
 
 REWRITE_PROMPT = ChatPromptTemplate.from_messages([
     ("system", REWRITE_SYSTEM),
@@ -614,6 +620,32 @@ _USD_PER_SHARE_RE = re.compile(r"\beps\s*\(\$\)", re.IGNORECASE)
 _INR_PER_SHARE_RE = re.compile(r"\beps\s*\(\s*(?:₹|`|rs\.?)\s*\)", re.IGNORECASE)
 _DOLLAR_VALUE_RE = re.compile(r"\$\s?\d")
 
+# Magnitude tiebreaker: balance-sheet pages often lose their unit caption to
+# the text splitter, so explicit markers miss. For Infosys-scale companies:
+#   - INR crore pages always print a >= 50,000 line (total assets ~1,45,000
+#     cr; total equity+liabilities; nine-month revenues).
+#   - USD million pages top out around $17,000M, never reaching 50,000.
+# So >= 50,000 -> INR, < 5,000 max -> USD, anything between stays unknown
+# (safer than wrong; the chunk lands mid-ranking, not last).
+# The regex accepts both Western grouping ("145,452") and Indian grouping
+# ("1,45,452") which is how PyMuPDF tends to render Infosys' rupee tables.
+_LARGE_NUMBER_RE = re.compile(r"\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b|\b\d{5,}\b")
+_INR_MAGNITUDE_THRESHOLD = 50_000
+_USD_MAGNITUDE_CEILING = 5_000
+
+
+def _max_numeric_value(text):
+    """Largest plain integer in the chunk (commas stripped). Returns 0 on no match."""
+    best = 0
+    for m in _LARGE_NUMBER_RE.finditer(text):
+        try:
+            v = int(m.group(0).replace(",", "").split(".")[0])
+            if v > best:
+                best = v
+        except ValueError:
+            continue
+    return best
+
 
 def _doc_currency(doc):
     """Classify a chunk as 'inr' | 'usd' | None.
@@ -638,6 +670,12 @@ def _doc_currency(doc):
         return "inr"
     if _DOLLAR_VALUE_RE.search(text):
         return "usd"
+    # Magnitude fallback for caption-less balance-sheet sub-chunks.
+    biggest = _max_numeric_value(text)
+    if biggest >= _INR_MAGNITUDE_THRESHOLD:
+        return "inr"
+    if 0 < biggest < _USD_MAGNITUDE_CEILING:
+        return "usd"
     return None
 
 
@@ -648,6 +686,28 @@ def _prefer_inr(docs):
         c = _doc_currency(d)
         (inr if c == "inr" else usd if c == "usd" else unk).append(d)
     return inr + unk + usd
+
+
+def _drop_redundant_usd(docs):
+    """For any source PDF where an INR chunk is present, drop the USD chunks
+    of the SAME source. Infosys press releases publish the same statement in
+    both units; once we have the INR version, the USD version is a duplicate
+    in a different scale that only invites the LLM to misread the unit (e.g.
+    quoting US$ 1,640M as ₹1,640 cr). Unknown-currency chunks are always kept.
+
+    Only applies per-source so we never drop the only chunk we have for some
+    period — if a period's only retrieval hit happens to be USD, it stays."""
+    inr_sources = {d.metadata.get("source") for d in docs
+                   if _doc_currency(d) == "inr" and d.metadata.get("source")}
+    if not inr_sources:
+        return docs
+    out = []
+    for d in docs:
+        if (_doc_currency(d) == "usd"
+                and d.metadata.get("source") in inr_sources):
+            continue
+        out.append(d)
+    return out
 
 
 # --- main entry -------------------------------------------------------------
@@ -698,15 +758,30 @@ def retrieve(question, source_filter=None, multi_sources=None,
         docs = []
         anchor_docs = []
         k_per = max(3, top_k // len(periods) + 2)
-        # Anchor probe: the consolidated statement of operations in INR is the
-        # page that holds revenue / cost / operating profit / net profit /
-        # EPS for the quarter. We pick the BEST anchor chunk per period and
-        # promote it to the front of the context so MAX_CONTEXT_CHUNKS can't
-        # drop the actual figures page when fan-out is heavy.
-        anchor_probe = (
-            "Revenues Cost of Sales Gross profit Operating profit "
-            "Net profit Basic EPS in rupees crore"
-        )
+        # Per-period anchor probe. We pick the BEST anchor chunk per period
+        # and promote it to the front of the context so MAX_CONTEXT_CHUNKS
+        # can't drop the actual figures page when fan-out is heavy.
+        # Probe and the "this chunk is the right table" gate depend on which
+        # financial statement the user is asking about. Default = income
+        # statement (the most common case); switches when detect_statement_targets
+        # names balance sheet / cash flow.
+        targets = detect_statement_targets(question)
+        target_stmts = {stmt for _, stmt in targets}
+        if "balance sheet" in target_stmts:
+            anchor_probe = ("Total assets Total equity Total liabilities "
+                            "Cash and cash equivalents Trade receivables "
+                            "Property plant and equipment in rupees crore")
+            anchor_must_have = ("Total assets", "Total equity")
+        elif "cash flow" in target_stmts:
+            anchor_probe = ("Cash flow from operating activities investing "
+                            "financing activities net increase decrease in cash")
+            anchor_must_have = ("operating activities", "investing activities")
+        else:
+            anchor_probe = (
+                "Revenues Cost of Sales Gross profit Operating profit "
+                "Net profit Basic EPS in rupees crore"
+            )
+            anchor_must_have = ("Revenues", "Operating profit")
         for p in periods:
             p_kwargs = _period_label_to_filter_kwargs(p)
             docs += _hybrid_retrieve(question, k=k_per,
@@ -718,28 +793,50 @@ def retrieve(question, source_filter=None, multi_sources=None,
                                          source_filter=source_filter,
                                          company_filter=company_filter,
                                          type_filter="table", **p_kwargs)
-                # Per-period anchor: pull table chunks, prefer INR, and pick
-                # the FIRST one whose content shows the "Revenues" row from
-                # the statement of comprehensive income. One guaranteed slot
-                # per period.
-                cand = _hybrid_retrieve(anchor_probe, k=6,
+                # Per-period anchor: prefer INR, pick the FIRST chunk that
+                # contains the target statement's signature rows. One
+                # guaranteed slot per period.
+                # type_filter="table" is good for the income-statement default
+                # (the IS is reliably extracted as a table), but balance-sheet
+                # and cash-flow sections frequently bleed into text chunks
+                # because pdfplumber misses the table boundary. Drop the
+                # type filter when a statement target is set so a text chunk
+                # carrying "Total assets ... Total equity" can win.
+                anchor_type_filter = None if targets else "table"
+                cand = _hybrid_retrieve(anchor_probe, k=8,
                                         source_filter=source_filter,
                                         company_filter=company_filter,
-                                        type_filter="table", **p_kwargs)
+                                        type_filter=anchor_type_filter,
+                                        **p_kwargs)
                 cand = _prefer_inr(cand)
                 picked = None
                 for d in cand:
-                    if "Revenues" in d.page_content and "Operating profit" in d.page_content:
+                    if all(kw in d.page_content for kw in anchor_must_have):
                         picked = d
                         break
                 if picked is None and cand:
                     picked = cand[0]
                 if picked is not None:
                     anchor_docs.append(picked)
+                # When a statement target is named, ALSO pull every chunk from
+                # the anchor's page — table extraction often splits the
+                # balance sheet across multiple chunks (one per section) and
+                # the labelled-totals row can land in a different chunk than
+                # the rest. Same logic the single-period path already uses.
+                if targets and picked is not None:
+                    src = picked.metadata.get("source")
+                    pg = picked.metadata.get("page")
+                    if src and pg:
+                        anchor_docs += [d for d in _all_docs()
+                                        if d.metadata.get("source") == src
+                                        and d.metadata.get("page") == pg]
         # Anchors first so they survive the MAX_CONTEXT_CHUNKS cap, then the
-        # rest of the fan-out hits in INR-preferred order.
+        # rest of the fan-out hits in INR-preferred order. Drop redundant USD
+        # duplicates of any source that also has an INR chunk — keeps the LLM
+        # from misreading US$ millions as ₹ crore.
         ordered = _dedupe(anchor_docs) + _prefer_inr(_dedupe(docs))
-        return _dedupe(ordered)[:config.MAX_CONTEXT_CHUNKS], numeric
+        ordered = _drop_redundant_usd(_dedupe(ordered))
+        return ordered[:config.MAX_CONTEXT_CHUNKS], numeric
 
     if multi_sources and not source_filter:
         # Multi-author comparison: per-source pull only, equal seats each.
@@ -824,7 +921,8 @@ def retrieve(question, source_filter=None, multi_sources=None,
     # 3. General hybrid base.
     base = _hybrid_retrieve(question, k=top_k, **flt)
 
-    docs = _prefer_inr(_dedupe(statement_bonus + board_bonus + type_bonus + base))[:config.MAX_CONTEXT_CHUNKS]
+    docs = _prefer_inr(_dedupe(statement_bonus + board_bonus + type_bonus + base))
+    docs = _drop_redundant_usd(docs)[:config.MAX_CONTEXT_CHUNKS]
     return docs, numeric
 
 
@@ -845,10 +943,37 @@ def _history_to_messages(history):
     return msgs
 
 
+_PRONOUN_RE = re.compile(
+    r"\b(it|its|he|him|his|she|her|hers|they|them|their|theirs|that|this|those|these|"
+    r"the (?:one|first|second|third|fourth|last|previous|same|other|former|latter))\b",
+    re.IGNORECASE,
+)
+_ENTITY_HINT_RE = re.compile(
+    r"\bfy\s*\d{2,4}\b|\bq[1-4]\b|\b(?:19|20)\d{2}\b|"
+    r"\b(?:infosys|infy|riil|reliance)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_self_contained(question):
+    """True if the question names its own entities (FY/Q/year/company) AND has
+    no back-references (pronouns, "that one", "the previous"). For these we
+    skip the rewriter entirely — it can only hurt (cf. the FY24/FY25 query
+    that got rewritten with FY26 + 'stock price' noise)."""
+    if _PRONOUN_RE.search(question):
+        return False
+    return bool(_ENTITY_HINT_RE.search(question))
+
+
 def rewrite_query(question, history, llm=None):
-    """Rewrite a follow-up into a standalone search query. Returns the question
-    unchanged if history is empty (saves a model call on first turn)."""
+    """Rewrite a follow-up into a standalone search query. Skipped when:
+      - there is no history (first turn), or
+      - the question already names its own entities and has no pronouns.
+    Both cases save a model call AND prevent the rewriter from inventing
+    extra entities ('FY26', 'stock price') that pollute slot detection."""
     if not history:
+        return question
+    if _is_self_contained(question):
         return question
     llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0)
     chain = REWRITE_PROMPT | llm | StrOutputParser()
@@ -904,26 +1029,35 @@ def ask(question, history=None, llm=None, mode=None):
     multi_sources = all_sources if len(all_sources) >= 2 else None
 
     # Company/period intent (financial corpora).
-    # PRIMARY: LLM structured extraction (handles paraphrases, typos, detached
-    #          tokens, relative dates -- things the regex can't reach).
-    # FALLBACK: regex detectors (fast, deterministic, used when the LLM call
-    #          fails, returns garbage, or extracts nothing actionable).
-    slots = nlu.extract_slots(f"{question}\n{rewritten}".strip())
+    # PRIMARY: LLM structured extraction over the ORIGINAL question only.
+    #          Feeding `rewritten` here previously let the rewriter inject
+    #          entities the user never asked about (e.g. FY26 into a FY24/FY25
+    #          query) and pollute the period filter.
+    # FALLBACK 1: re-run extraction on the rewritten query — but only if the
+    #          original yielded nothing actionable (true follow-up case).
+    # FALLBACK 2: regex detectors over the original question.
+    slots = nlu.extract_slots(question, history=history)
+    if slots is None and rewritten != question:
+        slots = nlu.extract_slots(rewritten, history=history)
+    nlu_metrics = []
     if slots is not None:
         all_companies = set(slots["companies"])
         all_periods = nlu.slots_to_periods(slots)
+        nlu_metrics = list(slots.get("metrics") or [])
     else:
-        all_companies = detect_all_companies(question, rewritten)
-        all_periods = detect_periods(question, rewritten)
+        all_companies = detect_all_companies(question)
+        all_periods = detect_periods(question)
         # Range expansion: "from FY24 to FY26" -> {FY24, FY25, FY26}; "Q3 FY23
-        # to Q3 FY24" -> {Q3FY23..Q3FY24}. Endpoints-only ("X vs Y") expand
-        # too -- harmless if the user meant just the endpoints.
-        all_periods = expand_period_range(all_periods, question, rewritten)
-        # "Q3 revenue from FY21 through FY26": free-standing Q3 isn't bound to
-        # any year, so narrow each FYxx -> Q3FYxx to actually target Q3 pages.
-        standalone_q = detect_standalone_quarter(question, rewritten)
+        # to Q3 FY24" -> {Q3FY23..Q3FY24}.
+        all_periods = expand_period_range(all_periods, question)
+        # Free-standing Q3 + annual range -> narrow each FYxx -> Q3FYxx.
+        standalone_q = detect_standalone_quarter(question)
         if standalone_q and all_periods and all(p.startswith("FY") for p in all_periods):
             all_periods = {f"Q{standalone_q}{p}" for p in all_periods}
+        # Last-ditch: if the original yielded nothing, retry on rewritten.
+        if not all_companies and not all_periods and rewritten != question:
+            all_companies = detect_all_companies(rewritten)
+            all_periods = expand_period_range(detect_periods(rewritten), rewritten)
     company_filter = next(iter(all_companies)) if len(all_companies) == 1 else None
     period_filter = next(iter(all_periods)) if len(all_periods) == 1 else None
     periods_for_fanout = all_periods if len(all_periods) >= 2 else None
@@ -942,6 +1076,24 @@ def ask(question, history=None, llm=None, mode=None):
         "history": _history_to_messages(history),
         "question": question,  # original — keeps tone natural
     })
+    # Unified slot dict for downstream consumers (fact extractor, analytics
+    # layer). Mirrors what NLU produced when it succeeded, but is also
+    # populated by the regex fallback path so callers don't need to care
+    # which extractor ran.
+    detected_statement = ""
+    targets = detect_statement_targets(question)
+    if targets:
+        # Pick the most specific statement name detected; rarely >1 in
+        # practice ('balance sheet' OR 'profit and loss' OR 'cash flow').
+        detected_statement = targets[0][1]
+    slots_out = {
+        "companies": sorted(all_companies),
+        "periods": sorted(periods_for_fanout) if periods_for_fanout
+                   else ([period_filter] if period_filter else []),
+        "statement": detected_statement,
+        "metrics": nlu_metrics,
+    }
+
     return {
         "answer": answer,
         "sources": docs,
@@ -954,6 +1106,7 @@ def ask(question, history=None, llm=None, mode=None):
         "periods": sorted(periods_for_fanout) if periods_for_fanout else None,
         "companies": sorted(all_companies) if len(all_companies) >= 2 else None,
         "mode": mode_name,
+        "slots": slots_out,
     }
 
 

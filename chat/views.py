@@ -15,6 +15,8 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
+import facts as facts_pipeline
+
 from . import rag
 from .models import Chat, Message
 from .serializers import ChatDetailSerializer, ChatSerializer, MessageSerializer
@@ -98,6 +100,32 @@ def message_create(request, chat_id):
         flags=result["flags"],
         mode=result.get("mode") or mode,
     )
+
+    # Slice-1 analytics layer: extract structured facts from this answer and
+    # upsert into MetricFact (+ FactProvenance + AnalysisNote). Wrapped in a
+    # broad try/except — the analytics pipeline MUST NEVER block or break the
+    # user-facing answer flow.
+    try:
+        slots = result.get("slots") or {}
+        counters = facts_pipeline.process_assistant_message(
+            message=assistant_msg,
+            question=question,
+            answer=result["answer"],
+            sources=result["sources"],
+            slots=slots,
+            statement=slots.get("statement") or "",
+        )
+        if counters.get("extracted"):
+            print(f"  [facts] msg#{assistant_msg.pk}: "
+                  f"{counters['extracted']} extracted -> "
+                  f"{counters['inserted']} new / "
+                  f"{counters['overwritten']} updated / "
+                  f"{counters['duplicate']} same / "
+                  f"{counters['skipped']} skipped")
+    except Exception as e:
+        # Belt-and-suspenders: process_assistant_message already swallows,
+        # but never let an analytics surprise reach the user.
+        print(f"  [facts] view-level catch: {type(e).__name__}: {str(e)[:120]}")
 
     # Auto-title a brand-new chat from its first question; touch updated_at so it
     # rises to the top of the sidebar.

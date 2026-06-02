@@ -73,8 +73,26 @@ Rules:
 - Use Indian FY convention: FY26 = Apr 2025 to Mar 2026. "fiscal 2024" -> 24.
 - "last N quarters/years" -> resolve relative to the LATEST FY in the corpus ({latest_fy}).
 - "infy"/"infosys" -> "infosys". "reliance"/"riil"/"reliance industrial infrastructure" -> "riil".
+- CARRY-OVER FROM HISTORY: if the current question does NOT name a company but the most recent user turn or assistant turn in the chat history was about exactly one company, INHERIT that company. Same for statement_variant. Do NOT inherit periods or metrics — those are specific to each question unless the user explicitly says "same period" / "those years".
 - If the question is non-financial (chitchat, document description), return all-empty slots with intent="explain".
 - Output JSON only, no prose, no markdown."""
+
+
+def _format_history_for_extraction(history, max_turns=4):
+    """Compact recent history for the slot extractor. Only the last few turns,
+    truncated, so the extractor can resolve carry-over without ballooning the
+    prompt."""
+    if not history:
+        return ""
+    window = history[-max_turns:]
+    lines = []
+    for turn in window:
+        role = turn.get("role", "?")
+        content = (turn.get("content") or "").strip().replace("\n", " ")
+        if len(content) > 400:
+            content = content[:400] + "..."
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
 
 
 def _build_system_prompt():
@@ -170,14 +188,23 @@ def _get_llm():
 def extract_slots(question, history=None, llm=None):
     """Run the structured-extraction call. Returns the validated slot dict, or
     None on ANY failure (timeout, bad JSON, empty after validation). The caller
-    must treat None as 'fall back to regex'."""
+    must treat None as 'fall back to regex'.
+
+    `history` (optional list of {role, content}) lets the extractor resolve
+    carry-over entities — e.g. when the prior turn was about Infosys and the
+    current question just says "compare balance sheets of Q3 FY24 and FY25",
+    the model can fill companies=["infosys"] from context."""
     if not question or not question.strip():
         return None
     llm = llm or _get_llm()
+    user_msg = question.strip()
+    hist_block = _format_history_for_extraction(history)
+    if hist_block:
+        user_msg = f"Chat history (most recent last):\n{hist_block}\n\nCurrent question:\n{user_msg}"
     try:
         msg = llm.invoke([
             ("system", _build_system_prompt()),
-            ("human", question.strip()),
+            ("human", user_msg),
         ])
         content = getattr(msg, "content", None) or ""
         raw = json.loads(content)
