@@ -1,10 +1,6 @@
 # FinRAG
 
-A local-first Retrieval-Augmented Generation (RAG) chatbot for PDF documents. Built as an internship project at FinSeal, targeting a private assistant for financial filings (balance sheets, annual reports, prospectuses) that runs on local infrastructure, with the option to offload the chat LLM to Ollama Cloud's free tier on RAM-constrained machines.
-
-**Status:** Phase 2 complete; backend/frontend migration (Phase 3) about to begin. The pipeline handles native-text PDFs, scanned/image-only PDFs (via Tesseract OCR), structured tables (via pdfplumber + Camelot + img2table), and **figures/diagrams** (via a local vision model — `granite3.2-vision:2b`). Retrieval is hybrid (BM25 + vector cosine) with numeric-intent table biasing, figure-intent figure biasing, statement-targeted whole-page retrieval, board/people listing retrieval, and multi-author per-source retrieval. The chat layer has **conversational memory** (query rewriter + last N turns) and Indian-number normalization for financial reports. A YAML-driven eval harness baselines retrieval and answer quality.
-
-> **Phase 3 (in progress):** replacing the Streamlit UI with a Django + DRF backend (DB-backed multi-chat history) and a plain HTML/JS frontend. On-the-fly user file upload is planned as future scope. The RAG core (`ingest.py`, `query.py`) is unchanged by this migration — Django imports and calls `ask()`.
+Local-first RAG chatbot for financial PDFs (quarterly reports, annual filings, balance sheets). Built as an internship project at FinSeal. Hybrid retrieval (BM25 + cosine) over a Chroma index, with table-aware chunking, OCR fallback, vision-model figure transcription, period/company-aware filtering, and a mode registry (Extract / Analyze / Compare) on top. Django + DRF backend with DB-backed multi-chat history; plain HTML/CSS/JS frontend.
 
 ---
 
@@ -12,22 +8,18 @@ A local-first Retrieval-Augmented Generation (RAG) chatbot for PDF documents. Bu
 
 | Layer            | Choice                                                                                  |
 | ---------------- | --------------------------------------------------------------------------------------- |
-| LLM              | `gpt-oss:20b-cloud` via [Ollama](https://ollama.com) Cloud (free tier; same local API). Any local Ollama chat model also works |
-| Embeddings       | `nomic-embed-text` (768-dim) via Ollama, with task prefixes (`search_query:` / `search_document:`) |
-| Vector store     | [ChromaDB](https://www.trychroma.com) (cosine similarity), persisted to disk            |
-| Keyword search   | [`rank-bm25`](https://github.com/dorianbrown/rank_bm25) via LangChain `BM25Retriever`   |
-| Retrieval fusion | LangChain `EnsembleRetriever` (reciprocal rank fusion)                                  |
-| PDF parsing      | [PyMuPDF](https://pymupdf.readthedocs.io) (`fitz`) for text, [pdfplumber](https://github.com/jsvine/pdfplumber) for tables |
-| OCR              | [Tesseract](https://github.com/tesseract-ocr/tesseract) via `pytesseract`               |
-| Borderless tables| [Camelot](https://camelot-py.readthedocs.io) (`stream` flavour, needs Ghostscript)      |
-| Tables on scans  | [img2table](https://github.com/xavctn/img2table) (OpenCV layout detection + Tesseract OCR) |
-| Vision (figures) | `granite3.2-vision:2b` via Ollama — describes diagrams/charts/screenshots into text |
-| Chunking & chain | [LangChain](https://python.langchain.com) (core + community + classic)                  |
-| Memory           | Query rewriter + `MessagesPlaceholder` history (last `HISTORY_TURNS` messages)          |
-| UI (current)     | [Streamlit](https://streamlit.io) — being replaced in Phase 3                            |
-| UI (Phase 3)     | Django + Django REST Framework backend · plain HTML/CSS/JS frontend                      |
+| LLM              | `gpt-oss:20b-cloud` via Ollama Cloud (any local Ollama chat model works)                 |
+| Embeddings       | `nomic-embed-text` (768-dim) with `search_query:` / `search_document:` task prefixes     |
+| Vector store     | ChromaDB (cosine), persisted to disk                                                     |
+| Keyword search   | `rank-bm25` via LangChain `BM25Retriever`                                                |
+| Fusion           | LangChain `EnsembleRetriever` (RRF)                                                      |
+| PDF parsing      | PyMuPDF (text) · pdfplumber + Camelot stream + img2table (tables) · Tesseract (OCR)      |
+| Vision           | `granite3.2-vision:2b` via Ollama — figure/diagram transcription                         |
+| Memory           | Query rewriter + last `HISTORY_TURNS` messages via `MessagesPlaceholder`                 |
+| Backend          | Django + Django REST Framework, SQLite (`Chat` / `Message` tables)                       |
+| Frontend         | Plain HTML/CSS/JS, `marked.min.js` vendored, Bloomberg/fintech theme                     |
 
-Embeddings, the vector store, OCR, tables, and figures run entirely locally. The only non-local calls are to the chat LLM when `gpt-oss:20b-cloud` is used — these still go through the local Ollama daemon at `http://localhost:11434`, which proxies to Ollama Cloud. Swap `LLM_MODEL` to a local model (e.g. `llama3.1:8b`) for a fully offline setup.
+Embeddings, vectorstore, OCR, tables, and figures run locally. Only the chat LLM is cloud (and is swappable for a local model).
 
 ---
 
@@ -35,417 +27,236 @@ Embeddings, the vector store, OCR, tables, and figures run entirely locally. The
 
 ```
 finrag/
-├── data/                    # Drop source PDFs here (gitignored)
-├── vectorstore/             # Persisted Chroma collection (gitignored, regenerated by ingest)
-├── evals/
-│   ├── qa.yaml              # Test cases: question + expected source/filter/substrings
-│   └── run.py               # Eval runner (--retrieval for fast mode, default = with LLM)
-├── config.py                # Central settings: paths, model names, chunking, retrieval params
-├── embeddings.py            # Nomic task-prefix wrapper + cosine-Chroma factory
-├── ingest.py                # Pipeline: PDF → (text | OCR) + tables → chunks → embeddings → Chroma
-├── ingest_figures.py        # Standalone restartable vision-pass: adds type="figure" chunks
-├── describe_figure.py       # Ad-hoc CLI: describe a single PDF page with a vision model
-├── query.py                 # Hybrid retrieval + RAG chain + CLI
-├── app.py                   # Streamlit chat UI
-├── requirements.txt
-└── .venv/                   # Local virtual environment
+├── data/<company>/*.pdf      # Source PDFs, grouped by company folder
+├── vectorstore/              # Persisted Chroma collection (gitignored)
+├── finrag_backend/           # Django project (settings, urls)
+├── chat/                     # DRF app: models, serializers, views, urls, rag bridge
+├── frontend/                 # index.html · style.css · app.js · marked.min.js
+├── evals/qa.yaml + run.py    # YAML-driven regression suite
+├── config.py                 # Paths, model names, chunking, retrieval params
+├── embeddings.py             # Nomic task-prefix wrapper + cosine-Chroma factory
+├── parsers.py                # Per-company filename → period metadata
+├── ingest.py                 # PDF → (text|OCR) + tables → chunks → embeddings → Chroma
+├── ingest_figures.py         # Restartable vision pass: type="figure" chunks
+├── query.py                  # Hybrid retrieval + intent detection + RAG chain
+├── modes.py                  # Mode registry: Extract / Analyze / Compare
+└── manage.py
 ```
 
 ---
 
 ## Configuration (`config.py`)
 
-| Setting                    | Default                | Notes                                                                |
-| -------------------------- | ---------------------- | -------------------------------------------------------------------- |
-| `LLM_MODEL`                | `gpt-oss:20b-cloud`    | Any Ollama-compatible chat model (cloud or local)                    |
-| `EMBEDDING_MODEL`          | `nomic-embed-text`     | If it contains "nomic", task prefixes are auto-applied                |
-| `OLLAMA_BASE_URL`          | `http://localhost:11434` |                                                                    |
-| `CHUNK_SIZE`               | `1000`                 | Characters per text chunk (tables are never split)                   |
-| `CHUNK_OVERLAP`            | `200`                  | Overlap to preserve context across chunk boundaries                  |
-| `COLLECTION_NAME`          | `finrag`               | Chroma collection identifier                                         |
-| `TOP_K`                    | `8`                    | Chunks returned to the LLM (more for numeric questions, see below)   |
-| `MMR_FETCH_K`              | `24`                   | Candidate pool MMR diversifies over                                  |
-| `MMR_LAMBDA`               | `0.7`                  | 1.0 = pure relevance, 0.0 = pure diversity                           |
-| `MAX_CONTEXT_CHUNKS`       | `24`                   | Hard cap on chunks sent to the LLM per query (after intent bonuses)  |
-| `HYBRID_BM25_WEIGHT`       | `0.5`                  | Weight of BM25 in the ensemble; vector weight = `1 - this`           |
-| `HISTORY_TURNS`            | `6`                    | Last N *messages* (= 3 Q&A pairs) sent to the LLM as conversation memory |
-| `OCR_ENABLED`              | `True`                 | Master switch for the OCR fallback                                   |
-| `OCR_DPI`                  | `300`                  | Render resolution for scanned pages                                  |
-| `OCR_MIN_CHARS`            | `30`                   | If `get_text()` returns fewer chars, treat the page as scanned       |
-| `OCR_LANG`                 | `"eng"`                | Tesseract language code                                              |
-| `TABLE_EXTRACTION_ENABLED` | `True`                 | Master switch for pdfplumber table extraction                        |
-| `TABLE_MIN_ROWS`           | `2`                    | Filter out "tables" smaller than this (likely noise)                 |
-| `TABLE_MIN_COLS`           | `2`                    |                                                                      |
-| `TABLE_STREAM_FALLBACK_ENABLED` | `True`            | Run Camelot stream when pdfplumber finds no tables on a native page  |
-| `TABLE_OCR_ENABLED`        | `True`                 | Run img2table on rendered images of OCR'd pages                      |
-| `VISION_MODEL`             | `granite3.2-vision:2b` | Ollama vision model for figure descriptions                          |
-| `VISION_DPI`               | `144`                  | Render resolution for vision-model calls (lower than OCR — vision models downsample) |
-| `VISION_TIMEOUT_SEC`       | `120`                  | Per-call timeout so a wedged vision runner can't block the script    |
-| `FIGURE_DESCRIPTIONS_ENABLED` | `False` *(opt-in)* | Master switch; usually off in `ingest.py`, run figures via `ingest_figures.py` |
-| `FIGURE_MIN_IMAGE_PX`      | `200`                  | Skip pages whose largest embedded image is smaller than this (logos) |
-| `FIGURE_PROMPT`            | *(see config)*         | Vision prompt: describe components, labels, axes, arrows             |
+| Setting                    | Default                  |
+| -------------------------- | ------------------------ |
+| `LLM_MODEL`                | `gpt-oss:20b-cloud`      |
+| `EMBEDDING_MODEL`          | `nomic-embed-text`       |
+| `CHUNK_SIZE` / `OVERLAP`   | `1000` / `200`           |
+| `TOP_K`                    | `8` (modes can bump to 12) |
+| `MMR_FETCH_K` / `LAMBDA`   | `24` / `0.7`             |
+| `MAX_CONTEXT_CHUNKS`       | `24`                     |
+| `HYBRID_BM25_WEIGHT`       | `0.5`                    |
+| `HISTORY_TURNS`            | `6`                      |
+| `OCR_*`                    | DPI 300, min 30 chars    |
+| `TABLE_*`                  | plumber + Camelot stream + img2table; min 2×2 |
+| `VISION_*`                 | granite3.2-vision:2b · DPI 144 · 120 s timeout |
 
-Changing `EMBEDDING_MODEL`, `CHUNK_SIZE`, the OCR/table flags, or any header behaviour requires deleting `vectorstore/` and re-running `ingest.py`.
+Schema-affecting changes (embedding model, chunk size, ingest headers) require wiping `vectorstore/` and re-ingesting.
 
 ---
 
-## Embeddings + vectorstore (`embeddings.py`)
-
-Two non-obvious things wrapped here so ingest and query stay in sync:
-
-1. **Nomic task prefixes.** `nomic-embed-text` is trained with task prefixes; queries should be prefixed `search_query: ` and indexed documents `search_document: `. Without them, similarity quality drops noticeably (sometimes catastrophically on entity-style queries). `NomicTaskEmbeddings` subclasses `OllamaEmbeddings` and auto-applies the right prefix per call.
-2. **Cosine similarity.** Chroma defaults to L2 distance, but nomic embeddings are designed for cosine. `make_vectorstore()` always sets `collection_metadata={"hnsw:space": "cosine"}`.
-
-If `EMBEDDING_MODEL` doesn't contain `"nomic"`, the wrapper is bypassed and plain `OllamaEmbeddings` is used.
-
----
-
-## Ingestion pipeline (`ingest.py`)
+## Ingestion (`ingest.py`)
 
 ```
-data/*.pdf
-   │
-   ├── author_from_filename()          # B076_RiyanshSachdev_FPR.pdf → "Riyansh Sachdev"
-   │                                     (empty string for non-person filenames like synthetic_balance_sheet_2.pdf)
-   │
+data/<company>/*.pdf
+   ├── parsers.parse_filename(company, name)   # q1-2026.pdf → {company:"infosys", period:"Q1FY26", fy:26, q:1}
    ├── For each page:
-   │       text = page.get_text()
-   │       if OCR_ENABLED and len(text) < OCR_MIN_CHARS:
-   │           text = _ocr_page(page)  # render at OCR_DPI, run Tesseract
-   │       emit Document(type="text", header + text, metadata={source, author?, page, ocr})
-   │
-   ├── For each page, extract tables:
-   │       if page was OCR'd:
-   │           img2table on the rendered pixmap (Tesseract under the hood)
-   │       else:
-   │           pdfplumber (ruled tables)
-   │           if pdfplumber found nothing:
-   │               Camelot stream (borderless / whitespace-aligned tables)
-   │       each table → Document(type="table", header + markdown, metadata={..., table_engine: "plumber"|"stream"|"img2table"})
-   │
-   ├── Figure descriptions (separate restartable pass — `ingest_figures.py`):
-   │       for each native page where page.get_images() contains an image ≥ FIGURE_MIN_IMAGE_PX:
-   │           render at VISION_DPI → granite3.2-vision:2b → text description
-   │           → Document(type="figure", header + "Figure description:\n" + desc, metadata={..., vision_model})
-   │       idempotent: skips pages already described in the collection
-   │
-   ├── RecursiveCharacterTextSplitter(1000/200) on text Documents only
-   │       (tables are kept whole — never split mid-row)
-   │
-   └── Chroma collection ("finrag"), cosine, nomic prefixes applied automatically
+   │     text = page.get_text() or _ocr_page(page) if too short
+   │     emit Document(type="text", header+text, metadata={source, company, period, fy, q, page, ocr})
+   ├── For each page, tables:
+   │     OCR'd page  → img2table on pixmap
+   │     native page → pdfplumber, fallback Camelot stream
+   │     emit Document(type="table", header+markdown, metadata={..., table_engine})
+   ├── Figures (separate restartable pass, ingest_figures.py):
+   │     vision model on figure-bearing native pages → Document(type="figure", description, metadata={..., vision_model})
+   ├── RecursiveCharacterTextSplitter(1000/200) on text only (tables kept whole)
+   └── Chroma (cosine, nomic prefixes), batched embedding (BATCH=64) with per-batch try/except
 ```
 
-Each chunk carries metadata: `source` (filename), `author` (string or `""`), `page`, `type` (`"text"` | `"table"` | `"figure"`), `ocr` (bool), and for tables `table_engine` (`"plumber"` | `"stream"` | `"img2table"`), and for figures `vision_model` (the model that produced the description).
-
-Chunk headers (prepended to `page_content` so they're embedded too):
+Every chunk header prepended to `page_content` so it gets embedded too:
 ```
 Document: <filename>
-Author: <name>          # only if filename matches B\d+_ pattern
-Page: <N>               # only for table chunks
+Company: <slug>          # e.g. infosys, riil
+Period:   <label>        # e.g. Q3FY24, FY25
+Page:     <N>            # tables only
 ```
+
+Per-company filename parsers live in `parsers.py` (`PARSERS` registry): Infosys quarterlies (`q1-2026.pdf` → `Q1FY26`), RIIL annuals (`Annual-Report-2024-25.pdf` → `FY25`). New companies = add one parser + register.
 
 Run:
 ```bash
-source .venv/bin/activate
-python ingest.py
+rm -rf vectorstore && python ingest.py
+python ingest_figures.py         # optional, slow, restartable
 ```
-
-Re-running adds to the existing collection. **Wipe `vectorstore/` before re-ingesting if you want a clean rebuild** (always do this after schema-affecting changes).
-
----
-
-## Figure descriptions (`ingest_figures.py`)
-
-Vision-model passes are slow (~30–60s per call on CPU) and can wedge the Ollama runner under sustained load. They run **separately** from the main `ingest.py` so a hang during vision can't blow up the rest of the index.
-
-Design:
-- One vision call per figure-bearing native page (OCR'd pages are skipped — they're already images, would match everything, and produce noise).
-- **Idempotent.** Skips pages whose `(source, page, type="figure")` chunk already exists in Chroma. Safe to rerun.
-- **Per-call timeout** via `ollama.Client(timeout=VISION_TIMEOUT_SEC)` so a wedged model fails one call instead of the whole script.
-- **Per-PDF persistence.** Each PDF's chunks are written to Chroma before moving to the next, so a mid-run crash keeps prior progress.
-- **Verbose progress.** Each call prints `[N/M] p.X: ok (Ys) — preview...` or `FAIL`.
-
-Usage:
-```bash
-# Plan only (no vision calls)
-python ingest_figures.py --dry-run
-
-# Validate end-to-end on a single PDF, small batch
-python ingest_figures.py --source riyansh --limit 3
-
-# Run everything that isn't already done
-python ingest_figures.py
-
-# Force re-describe (e.g. after changing the prompt or model)
-python ingest_figures.py --source riyansh --force
-
-# Override prompt / model per run
-python ingest_figures.py --source riyansh --prompt "..." --model llama3.2-vision
-```
-
-There's also **`describe_figure.py`** — a tiny ad-hoc CLI for one-shot figure inspection without touching the vectorstore:
-```bash
-python describe_figure.py riyansh 16
-```
-
-### Why a separate vision model
-`granite3.2-vision:2b` (IBM, ~2 GB) was picked over alternatives because:
-- **moondream** (1.7 GB) — couldn't read labels on dense diagrams.
-- **llama3.2-vision** (7.9 GB) — quality is great but OOM-crashes on a 16 GB MacBook when llama3.1:8b is also loaded.
-- **granite3.2-vision:2b** — purpose-built for document understanding, reads labels reliably, fits alongside the chat LLM.
 
 ---
 
 ## Query pipeline (`query.py`)
 
 ```
-question (+ conversation history)
+question (+ history)
    │
-   ├── rewrite_query(question, history, llm)
-   │        ↳ rewrites follow-ups into standalone queries ("and the second one?" →
-   │           "what is the total revenue of Apex Financial Services") using few-shot prompt
+   ├── rewrite_query()                          # follow-ups → standalone
    │
-   ├── detect_all_sources(question, rewritten) / detect_source_filter(...)
-   │        ↳ one known author token  → hard-filter to that file
-   │        ↳ two+ author tokens      → multi_sources mode (per-source retrieval bonus)
+   ├── intent detection (on question + rewritten):
+   │     detect_company_filter()                # token + phrase aliases ({"riil","reliance","rel industrial"} → "riil")
+   │     detect_periods()                       # Q3FY24, Q3 FY 2024, third quarter of FY24, FY25, ...
+   │     expand_period_range()                  # "from X to Y" / "X vs Y" / "X through Y" → closed interval (cap 16)
+   │     _period_label_to_filter_kwargs()       # "Q3FY24"→period_filter ; "FY24"→fy_filter=24 (matches quarterly chunks)
+   │     is_numeric / is_figure / is_board / detect_statement_targets()
    │
-   ├── intent detection (run on question + rewritten):
-   │        is_numeric_question   → financial keywords / currency / year / number tokens
-   │        is_figure_question    → figure/diagram/chart/architecture/flowchart/...
-   │        is_board_question     → board/directors/management/people-listing intent
-   │        detect_statement_targets → "standalone/consolidated" × "P&L / balance sheet / cash flow"
+   ├── retrieve(question, company_filter, period_filter|fy_filter, mode.top_k):
+   │     SINGLE-period  → one hybrid pass with hard filter
+   │     MULTI-period   → fan-out: one hybrid pass per period
+   │                       + per-period ANCHOR PROBE (see below)
+   │     MULTI-company  → falls back to hybrid (no filter)
    │
-   ├── retrieve(question, source_filter, multi_sources):
-   │       hybrid = BM25 (lowercased + word-tokenized) + Vector (Chroma MMR, cosine)
-   │                fused via LangChain EnsembleRetriever (weights HYBRID_BM25_WEIGHT / 1-w)
+   │     priority: anchor_docs → statement_bonus → board_bonus → type_bonus → per-source/period bonus → base
+   │     deduped, INR-preferred sort, capped at MAX_CONTEXT_CHUNKS
    │
-   │       priority order (bonuses come FIRST, then deduped, then capped at MAX_CONTEXT_CHUNKS):
-   │         statement_bonus  → WHOLE pages (text+table) matching the targeted statement
-   │         board_bonus      → people/board listing pages (via _BOARD_PROBE)
-   │         type_bonus       → table chunks (numeric) and/or figure chunks (figure)
-   │         per-source bonus → one slice per author in multi_sources mode
-   │         base             → corpus-wide hybrid (skipped in multi_sources mode)
+   ├── format_context()
+   │     "[i] (filename p.N · company · PERIOD) [TYPE]\n<chunk>"
+   │     _normalize_indian_numbers()   # collapse "9 83" → 983, comma-format
    │
-   ├── format_context(docs)
-   │        ↳ "[i] (filename p.N) [TEXT|TABLE|FIGURE]\n<chunk>"
-   │        ↳ _normalize_indian_numbers(): collapse space-grouped digits ("9 83" → "983")
-   │           and format with commas ("1197" → "1,197"); safe against years / versions / note refs
-   │        ↳ FIGURE chunks get an "AUTHORITATIVE TRANSCRIPTION" framing prepended
-   │
-   └── PROMPT (system + history placeholder + question) | ChatOllama | StrOutputParser
-            ↳ thorough answer, inline [filename p.N] citations, refuses to fabricate,
-              reads Indian-format numbers, trusts labeled totals (never recomputes)
+   └── PROMPT[mode] | ChatOllama | StrOutputParser
 ```
 
-### Why hybrid retrieval
+### Currency-aware retrieval
 
-Pure vector search underperforms on **entity / proper-noun queries** ("Apex Financial Services", "TRIGRS model", ticker symbols, line-item labels). The cosine similarity between a query mentioning a company name and the actual chunk containing it can be lower than the similarity to an unrelated chunk that simply talks about "financial services" in general. BM25 nails these because it scores literal token overlap. The two methods cover each other's weaknesses; the ensemble is more robust than either alone.
+Infosys press releases publish the same statement of operations TWICE — once in `(In ₹ crore...)` and once in `(in US $ millions)`. Same business, different scale (e.g. Q3FY24 revenue = ₹38,821 cr vs US$4,663 M). Pre-fix, the model conflated the two.
 
-The BM25 retriever is rebuilt per query against the in-memory corpus (loaded lazily from Chroma on first call) so it can honour the same `source` / `type` filters as the vector retriever.
+`_doc_currency(doc)` classifies each chunk as `inr` / `usd` / `None` via three fingerprints, in order:
+1. Header marker (`(In ₹ crore...)` / `(in US $ millions)`)
+2. EPS unit regex (`EPS (₹)` vs `EPS ($)`) — survives sub-chunks where the caption was split off
+3. `$N` value pattern fallback
 
-### Numeric-intent table biasing
+`_prefer_inr(docs)` stable-sorts INR first, unknown middle, USD last — never deletes.
 
-Half the slots in the context window are reserved for `type: "table"` chunks when the question looks numeric. Without this, a question like "what's the inventory amount" can pull the narrative page that says the inventory line exists, but miss the actual table with the number. Tables are stored as Markdown so the LLM can quote rows back verbatim.
+### Anchor probe (multi-period fan-out)
 
-### Author filter
+The `MAX_CONTEXT_CHUNKS=24` cap can starve a period of its statement-of-operations chunk when MMR diversifies the candidate pool. Per period, an extra hybrid pass pulls 6 `type="table"` candidates against a fixed probe (`"Revenues Cost of Sales Gross profit Operating profit Net profit Basic EPS in rupees crore"`), filters to INR, picks the first chunk containing both `Revenues` and `Operating profit`, and prepends it. One guaranteed INR statement-of-ops chunk per requested period.
 
-`detect_source_filter()` builds a name → filename index from `data/` (first names, last names, ≥3 chars). If a question contains tokens matching **exactly one** known author, retrieval (both BM25 and vector) is hard-filtered to that PDF. Two-author or ambiguous queries skip the filter and fall back to corpus-wide retrieval.
+### Modes (`modes.py`)
 
-### Statement-targeted retrieval (financial reports)
+Mode = one dict (`system_prompt`, `top_k`, `max_context_chunks`, `temperature`). Adding a mode = adding one entry; no other code changes.
 
-For questions naming a financial statement (e.g. "consolidated cash flow", "standalone profit and loss"), `detect_statement_targets()` resolves the variant (standalone/consolidated) × statement (P&L / balance sheet / cash flow) and pulls the **whole matching pages** (both their text and table chunks) to the front of the context. This fixes a class of bugs where a statement's title, narrative, and table land in different sub-chunks and only some get retrieved — leaving the model to estimate or conflate standalone vs. consolidated figures.
+| Mode      | top_k | Output shape                                                                 |
+| --------- | ----- | ---------------------------------------------------------------------------- |
+| `extract` | 8     | Verbatim figures with `[filename p.N]` citations. Terse.                     |
+| `analyze` | 12    | `## Headline / ## Key observations / ## Risks & flags / ## Bottom line`      |
+| `compare` | 12    | `## Framing / ## Comparison table / ## Deltas & interpretation / ## Bottom line` |
 
-### Board / people-listing retrieval
+The base prompt enforces: Indian FY mapping (Q1=Apr–Jun, … Q3=Oct–Dec), currency discipline (one unit per answer, never mix ₹ with $), Indian-digit normalization, trust labeled totals, refuse rather than fabricate.
 
-`is_board_question()` detects directors/board/management/people-listing intent and uses a fixed `_BOARD_PROBE` to surface the company-info / board listing page, which otherwise loses to the denser Corporate Governance pages under plain hybrid retrieval.
+Mode is **per-message** and **user-picked** (no auto-routing). The frontend defaults the composer to the last mode used in the chat.
 
-### Multi-author retrieval
+### Other intent paths (carried over from Phase 2)
 
-When a question names two or more known authors, retrieval enters `multi_sources` mode: it drops the corpus-wide base and instead reserves a per-author slice so cross-document comparisons don't get dominated by one author's chunks (which previously caused mis-attribution).
-
-### Indian-number normalization
-
-Financial PDFs often render figures with space-grouped digits ("9 83", "11 97") that survive extraction and read as garbage. `_normalize_indian_numbers()` (applied in `format_context`) collapses these and re-formats with commas (`₹1,197 lakh`), with guards so years (`2024-25`), version numbers (`v4.1.3`), and note references (`Note 8`) are left untouched.
-
-### Conversational memory
-
-`ask()` accepts a `history` list. `rewrite_query()` first turns context-dependent follow-ups into standalone queries (so retrieval works on "and the second one?"), then the resolved history (last `HISTORY_TURNS` messages) is injected into the prompt via `MessagesPlaceholder("history")`. The UI is responsible for storing and trimming history; `ask()` only consumes what it's given.
-
-### Inline citations
-
-The prompt requires every concrete fact to carry a `[filename p.N]` marker, taken from the chunk headers. For financial queries this makes the source of each number traceable to a specific page.
-
-### CLI
-
-```bash
-python query.py "summarize Riyansh's project"
-python query.py "what are the total assets of apex financial services"
-```
-
-### Programmatic
-
-```python
-from query import ask
-result = ask("what tech stack did Prakarsh use", history=prior_messages, llm=llm)
-# history = [{"role": "user"|"assistant", "content": str}, ...]  (without the current question)
-# result = {
-#     "answer": str,
-#     "sources": List[Document],
-#     "filtered_to": str | None,      # single-author filter, if any
-#     "multi_sources": List[str]|None,# files in multi-author per-source mode, if any
-#     "numeric": bool,                # whether table-biased retrieval ran
-#     "rewritten_query": str | None,  # standalone rewrite of a follow-up, if rewritten
-# }
-```
+- **Statement-targeted retrieval** — standalone/consolidated × P&L/BS/CF triggers whole-page (text + table) bonuses.
+- **Board / people-listing** — fixed probe surfaces company-info pages.
+- **Multi-author** — per-source slice when ≥2 known authors are named.
+- **Numeric intent** — half the context window reserved for table chunks.
+- **Figure intent** — figure chunks get an "AUTHORITATIVE TRANSCRIPTION" framing.
 
 ---
 
-## Streamlit UI (`app.py`)
+## Backend (`finrag_backend/` + `chat/`)
 
-> Being replaced in Phase 3 by the Django + HTML/JS stack. Documented here as the current working UI.
+DRF API under `/api`:
 
-Chat interface at `http://localhost:8501`. Per turn:
+| Method | Path                       | Body                       | Returns                                   |
+| ------ | -------------------------- | -------------------------- | ----------------------------------------- |
+| GET    | `/modes`                   | —                          | `{modes:[{id,label,description}], default}` |
+| GET    | `/chats`                   | —                          | List of chats (id, title, message_count)  |
+| POST   | `/chats`                   | `{title?}`                 | New chat                                  |
+| GET    | `/chats/{id}`              | —                          | Chat + full message list                  |
+| DELETE | `/chats/{id}`              | —                          | 204                                       |
+| POST   | `/chats/{id}/messages`     | `{question, mode?}`        | `{user_message, assistant_message, rewritten_query}` |
 
-1. Rewrite the question against history, detect source filter(s) and numeric/figure/board/statement intent.
-2. Run hybrid retrieval with the relevant intent bonuses.
-3. Render: an optional flags caption (`Rewrote → …`, `Filtered to: …`, `Multi-author → …`, `Numeric intent → table-biased retrieval`), the answer (Markdown), and an expandable **Sources** panel. Table chunks render as actual Markdown tables; text chunks render as raw text. Each source row is tagged 📄 TEXT, 📊 TABLE, or 🖼️ FIGURE.
+Models: `Chat(id, title, created_at, updated_at)` + `Message(chat FK, role, content, sources JSON, flags JSON, mode, created_at)`. Title auto-derived from the first question. `chat/rag.py` is the thin bridge into `query.ask()`.
 
-The sidebar has a **🗑️ New chat** button and a message-count caption (stored vs. sent — "last N sent to model (~M Q&A pairs)"). Session history is kept in `st.session_state.history` for the duration of the tab and trimmed to `HISTORY_TURNS` before being passed to `ask()`. This per-tab, in-RAM history is exactly what Phase 3 moves into a database (`Chat` / `Message` tables) for persistent, multi-chat history.
-
-Run:
-```bash
-source .venv/bin/activate
-streamlit run app.py
-```
-
-First-run prompts are suppressed via `~/.streamlit/config.toml` (`headless = true`, `gatherUsageStats = false`).
+`/` serves `frontend/index.html`; the rest is static via `STATICFILES_DIRS = [BASE_DIR / "frontend"]`. CORS open in dev.
 
 ---
 
-## Evaluation (`evals/`)
+## Frontend (`frontend/`)
 
-A small YAML-driven harness so retrieval, filter detection, and answer quality can be regression-tested before changing prompts or retrieval parameters.
+Plain HTML/CSS/JS — no framework, no build step, just `fetch()`. Bloomberg/fintech aesthetic: IBM Plex Mono + Inter, dark slate `#0a0e14`, amber + green data accents, tabular numerals. Markdown rendered via vendored `marked.min.js` (GFM tables + line breaks).
 
-`evals/qa.yaml` — each case specifies:
-
-```yaml
-- question: "what are the total assets of apex financial services"
-  expect_source: synthetic_balance_sheet_2.pdf   # filename(s) that must appear in retrieved docs
-  expect_filter: null                            # detect_source_filter() should resolve to this
-  expect_substrings: ["825,000"]                 # all must appear in the answer (case-insensitive)
-  forbid_substrings: ["cannot provide"]          # none may appear
-  expect_numeric: true                           # is_numeric_question() must match
-```
-
-`evals/run.py` modes:
-
-```bash
-python evals/run.py --retrieval   # ~1s total; scores retrieval + filter + numeric only. Use during dev.
-python evals/run.py               # full run with LLM (cloud gpt-oss is fast; local 8B models ~10-15 min)
-python evals/run.py --case 6      # single case for debugging
-```
-
-Per case the runner prints PASS/FAIL for each check with diagnostics; the footer summarises by check kind and exits non-zero on any failure.
-
-The current suite (11 cases) covers: author-filter single-doc lookups, the OCR path (Jash's fully-scanned PDF) with no-filter BM25 entity match, four numeric-table queries against the synthetic balance sheets (including a regression case for a model refusal that was previously triggered by certain phrasings), one cross-doc comparison, and one off-topic grounding test.
+- Sidebar: chat list + `+ New Query`.
+- Messages pane: per-role bubbles, mode badge on assistant rows, expandable Sources panel (📄 TEXT / 📊 TABLE / 🖼️ FIGURE).
+- Composer: `<select id="mode-select">` (EXTRACT / ANALYZE / COMPARE) + input + send. Defaults to the last mode used in the chat.
+- Flags caption (when present): `Rewrote → …`, `Company → infosys`, `Period → Q3FY24`, `Period range → Q3FY24,Q3FY25,Q3FY26`, `Multi-company → …`.
 
 ---
 
 ## Prerequisites
 
-- macOS / Linux (tested on macOS)
-- Python 3.10+ (developed on 3.13)
-- System packages:
-  ```bash
-  brew install tesseract ghostscript   # macOS (ghostscript is required by Camelot)
-  # apt-get install tesseract-ocr ghostscript   # Linux
-  ```
-- Ollama installed and running:
-  ```bash
-  ollama pull nomic-embed-text
-  ollama pull granite3.2-vision:2b   # optional, only for figure descriptions
-  ollama serve   # usually runs as a background service on install
-
-  # Chat LLM — pick ONE:
-  ollama signin                       # then use the cloud model (default, light on RAM)
-  #   LLM_MODEL = "gpt-oss:20b-cloud"
-  # or, fully offline:
-  ollama pull llama3.1:8b             # set LLM_MODEL = "llama3.1:8b" in config.py
-  ```
-- Python deps:
-  ```bash
-  python -m venv .venv
-  source .venv/bin/activate
-  pip install -r requirements.txt
-  ```
+```bash
+brew install tesseract ghostscript   # macOS; or apt-get on Linux
+ollama pull nomic-embed-text
+ollama pull granite3.2-vision:2b     # optional, figures only
+# Chat LLM — pick ONE:
+ollama signin                         # gpt-oss:20b-cloud (default, light on RAM)
+# OR
+ollama pull llama3.1:8b               # set LLM_MODEL in config.py for fully offline
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python manage.py migrate
+```
 
 ---
 
 ## End-to-end usage
 
 ```bash
-# 1. Add PDFs
-cp ~/Downloads/*.pdf data/
-
-# 2. Build the index (OCRs scanned pages, extracts tables)
+# 1. Drop PDFs into data/<company>/
+# 2. Build index
 rm -rf vectorstore && python ingest.py
+python ingest_figures.py             # optional
 
-# 3. (optional) Add figure descriptions on top — slow, restartable
-python ingest_figures.py
+# 3. Run backend (serves API + frontend)
+python manage.py runserver           # http://localhost:8000
 
-# 4. Launch the UI
-streamlit run app.py
-
-# 5. (optional) Sanity-check retrieval after any change
-python evals/run.py --retrieval
+# 4. Regression check
+python evals/run.py --retrieval      # ~1s, no LLM
+python evals/run.py                  # full, with LLM
 ```
 
-One-shot CLI:
-```bash
-python query.py "your question here"
-```
+CLI fallback: `python query.py "your question"`.
 
 ---
 
-## Design decisions worth flagging
+## Design decisions
 
-- **Hybrid BM25 + vector with cosine + nomic prefixes.** Each of these is small individually; together they're the difference between "the model can't find Apex Financial Services" and reliable entity retrieval. The single biggest quality lever in the project.
-- **Numeric-intent table biasing.** Tables are first-class chunks (Markdown-serialised, never split) and get reserved seats in the context window when the question is quantitative. Without this, the table chunk often loses to nearby narrative pages that mention the same line items in prose.
-- **Author header injection at ingest time.** Embeds author names into every text chunk of person-style reports, so "Vikhyat's methodology" matches Vikhyat's pages even when his name doesn't appear in the body. Skipped for non-person filenames so we don't inject `Author: synthetic balance sheet 2` noise.
-- **Hard source filtering on unambiguous author mentions.** More reliable than embedding-only retrieval for name-scoped questions; complements rather than replaces it.
-- **OCR is fallback, not default.** The OCR path only fires when `get_text()` returns less than `OCR_MIN_CHARS`. Native text is always preferred (faster, lossless).
-- **Three-engine table extraction, picked per page.** pdfplumber for ruled tables (cheap and accurate when borders exist), Camelot `stream` as a fallback for borderless/whitespace-aligned tables on native pages, and img2table on the rendered pixmap for OCR'd pages. Each chunk records which engine produced it (`table_engine` metadata) so quality can be evaluated by source.
-- **Vision pass is separate, restartable, and idempotent.** Figure descriptions are generated by a dedicated script (`ingest_figures.py`) rather than baked into `ingest.py`, because vision calls are slow and the local runner can wedge under sustained load. Persisting per-PDF + skipping already-done pages means a crash mid-run costs minutes, not the whole index.
-- **Strict grounding in the prompt.** The LLM is told the context is authoritative, must cite inline `[filename p.N]`, and must refuse rather than fabricate. Explicitly told not to refuse on privacy / "private company" grounds because the user owns the documents.
-- **Eval-gated changes.** The `--retrieval` mode runs in ~1 second, making it cheap to validate any change to chunking, filters, weights, or BM25 tokenization before paying for an LLM run.
+- **Hybrid BM25 + vector with nomic task prefixes** — biggest single quality lever. BM25 nails entity / line-item queries that pure cosine misses.
+- **Tables are first-class chunks**, Markdown-serialised, never split. Reserved seats in the context window for numeric questions.
+- **Period metadata at ingest time.** Filename → period via per-company parser registry (`parsers.py`); the period is hard-filtered at retrieval, not left to the LLM to filter from text.
+- **Annual labels translate to numeric `fy_filter`** so `FY24` matches chunks tagged `Q1FY24..Q3FY24` even when no annual-period chunk exists.
+- **Mode registry over agentic routing.** User picks Extract / Analyze / Compare per message; no LLM router in the loop. Easier to reason about, cheaper, deterministic.
+- **Currency-aware retrieval + INR-first sort.** Prompt rules alone weren't enough — Infosys publishes ₹-crore and US$-million versions of the same table on adjacent pages. Detect at the chunk level, demote USD.
+- **Per-period anchor probe.** Guarantees the INR statement-of-operations chunk for every requested period survives the `MAX_CONTEXT_CHUNKS` cap in multi-period fan-out.
+- **Vision pass is separate, restartable, idempotent.** Vision calls are slow and the local runner can wedge; persisting per-PDF + skipping done pages means a crash costs minutes, not the whole index.
+- **DB-backed history.** `Chat` / `Message` rows replace Streamlit's per-tab `session_state`. Per-message `mode` stored so the frontend can default the composer correctly on re-open.
 
 ---
 
 ## Known limitations
 
-- **Memory is per-tab and in-RAM (Streamlit).** Conversational memory works (query rewriter + history placeholder), but history lives in `st.session_state` and dies on refresh — no persistent or multiple saved chats. Phase 3 (Django + DB) addresses this.
-- **No cross-encoder re-ranker.** The ensemble is unweighted RRF; for highly competitive numeric queries a re-ranker (e.g. `bge-reranker-base`) could push the right chunk to position 1. Not added until eval shows the need.
-- **Single-collection index.** All PDFs live in one Chroma collection; per-document or per-domain collections would help if the corpus grows past a few hundred files.
-- **BM25 corpus is loaded into memory.** Fine at this scale (hundreds of chunks); would need rework for tens of thousands.
-- **Camelot stream is noisier than pdfplumber.** It happily produces "tables" out of multi-column body text. We filter by `TABLE_MIN_ROWS` / `TABLE_MIN_COLS` and stash an `table_engine` metadata field so noisy chunks can be down-weighted later if needed.
-- **img2table quality depends on scan resolution.** Tables on low-DPI or skewed scans may be partially reconstructed; tuning `OCR_DPI` upward (and adding deskew/binarise pre-processing) helps.
-- **Figure-question answer quality is model-dependent.** The vision pipeline correctly generates and retrieves figure descriptions (rank #1 for figure-intent queries, with an "AUTHORITATIVE TRANSCRIPTION" framing in the prompt). Small local models like `llama3.1:8b` often refuse to synthesise from them and fall back to inference from surrounding text; the larger `gpt-oss:20b-cloud` handles them correctly. This is a model-class limitation, not a pipeline bug — no code change is needed to fix it, just a stronger chat LLM.
-- **Cloud LLM is not fully offline.** The default `gpt-oss:20b-cloud` sends prompts (retrieved context included) to Ollama Cloud. For a strictly on-prem deployment, switch `LLM_MODEL` to a local model — the rest of the pipeline is unchanged.
-
----
-
-## Troubleshooting
-
-| Symptom                                                | Fix                                                                                                          |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `ConnectionError` from Ollama                          | Ensure `ollama serve` is running and both models are pulled.                                                 |
-| `TesseractNotFoundError` during ingest                 | `brew install tesseract` (macOS) or `apt-get install tesseract-ocr` (Linux). OCR auto-disables otherwise.    |
-| `0 non-empty pages` on a scanned PDF                   | Confirm `OCR_ENABLED=True` and Tesseract is on PATH. Check `OCR_MIN_CHARS` — it triggers OCR below this.     |
-| Entity question (company / proper noun) misses         | Hybrid BM25 should catch this. If not, check tokenization in `_bm25_tokenize` and confirm the chunk content actually contains the term (`vs.get(where={"source": "..."})`). |
-| Numeric question misses the right table                | Confirm `is_numeric_question()` returns True for the phrasing; if False, add a keyword to `_NUMERIC_KEYWORDS`. |
-| Model refuses on a clearly answerable question         | Re-check the prompt's "do not refuse on privacy grounds" line is intact; some small local models still trigger residual safety behavior on certain phrasings. Try rephrasing or switch to `gpt-oss:20b-cloud`. |
-| Streamlit prompts for email on first run               | A `~/.streamlit/config.toml` with `headless = true` suppresses it.                                           |
-| Answers reference a PDF you've since removed           | Wipe `vectorstore/` and re-run `ingest.py`.                                                                  |
-| Retrieval returns boilerplate (cover, certificates)    | Increase `MMR_LAMBDA` toward 1.0 (more relevance) or lower it toward 0.0 (more diversity). Eval first.       |
-| `ingest_figures.py` hangs on one PDF                   | Per-call timeout (`VISION_TIMEOUT_SEC`) handles individual wedges. If the runner itself is stuck (`ollama ps` shows `Stopping...`), `kill -9` the script, restart Ollama, and rerun — already-done pages will be skipped. |
-| Figure answer in chat is generic ("no description")    | Retrieval is probably fine — check the Sources panel for a `🖼️ FIGURE` chunk. If it's there but a small local model is ignoring it, that's the documented model-class limitation, not a bug; `gpt-oss:20b-cloud` handles figure synthesis correctly. |
+- **No cross-encoder re-ranker.** RRF ensemble only; a re-ranker (`bge-reranker-base`) could push the right chunk to rank 1 on competitive numeric queries.
+- **Single-collection index.** Fine at hundreds of PDFs; per-domain collections would help past that.
+- **BM25 corpus in RAM.** Fine at this scale; needs rework at tens of thousands of chunks.
+- **Camelot stream is noisier than pdfplumber.** Filtered by `TABLE_MIN_ROWS/COLS` + `table_engine` metadata for later down-weighting.
+- **No Q4 data in the current Infosys corpus** — FY-level totals aren't extractable from Q1–Q3 alone.
+- **Cloud LLM is not fully offline.** Default `gpt-oss:20b-cloud` ships prompts (with retrieved context) to Ollama Cloud. Switch `LLM_MODEL` to a local model for strict on-prem.
+- **On-the-fly user upload** is deliberately deferred — the ingest pipeline assumes the `data/<company>/` layout.
