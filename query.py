@@ -24,6 +24,7 @@ from modes import DEFAULT_MODE, get_mode
 import nlu
 import cache as fact_cache
 import recall as analysis_recall
+import uploads as upload_store
 
 
 SYSTEM_PROMPT = """You are a document-grounded assistant. The user owns and has provided the documents below; you must use them to answer.
@@ -987,7 +988,7 @@ def rewrite_query(question, history, llm=None):
     return rewritten or question
 
 
-def ask(question, history=None, llm=None, mode=None):
+def ask(question, history=None, llm=None, mode=None, upload_ids=None):
     """Run one RAG turn.
 
     Args:
@@ -1078,6 +1079,12 @@ def ask(question, history=None, llm=None, mode=None):
     cached_facts = []
     cache_short_circuit = False
     cached_chunk = None
+    # Uploads are not in MetricFact, so the cache can NEVER fully cover a
+    # question that depends on uploaded content. Disable short-circuit
+    # whenever a PDF is attached -- we still consult the cache for any
+    # curated-corpus facts that might overlap, but RAG always runs.
+    upload_ids = list(upload_ids or [])
+    has_uploads = bool(upload_ids)
     try:
         slots_for_cache = {
             "companies": sorted(all_companies),
@@ -1091,6 +1098,7 @@ def ask(question, history=None, llm=None, mode=None):
         if cached_facts:
             cached_chunk = fact_cache.format_facts_as_context_chunk(cached_facts)
             if (config.FACT_CACHE_SHORTCIRCUIT_RAG
+                    and not has_uploads
                     and fact_cache.is_full_coverage(cached_facts, slots_for_cache)):
                 cache_short_circuit = True
     except Exception as e:
@@ -1121,11 +1129,29 @@ def ask(question, history=None, llm=None, mode=None):
                                  period_filter=period_filter,
                                  periods=periods_for_fanout,
                                  top_k=mode_cfg["top_k"])
+        # Per-chat uploaded PDFs: pull chunks from each upload's own Chroma
+        # collection and fuse with the corpus hits. Uploads come FIRST so the
+        # MAX_CONTEXT_CHUNKS cap can't drop them when the corpus also has
+        # plausible hits -- the user explicitly attached this file.
+        upload_docs = []
+        if has_uploads:
+            try:
+                upload_docs = upload_store.retrieve_from_uploads(
+                    rewritten, upload_ids,
+                )
+            except Exception as e:
+                print(f"  [uploads] retrieve failed "
+                      f"({type(e).__name__}: {str(e)[:120]})")
+                upload_docs = []
         # Inject cached facts at the very front when we have ANY hits. They
         # take a single seat and the LLM uses them verbatim, eliminating
         # reading errors on the cells we've already validated.
+        head = []
         if cached_chunk is not None:
-            docs = [cached_chunk] + docs[:config.MAX_CONTEXT_CHUNKS - 1]
+            head.append(cached_chunk)
+        head.extend(_dedupe(upload_docs))
+        docs = head + docs
+        docs = docs[:config.MAX_CONTEXT_CHUNKS]
     context = format_context(docs)
 
     chain = mode_prompt | llm | StrOutputParser()
@@ -1179,6 +1205,7 @@ def ask(question, history=None, llm=None, mode=None):
         # badges and we can track hit rate in logs.
         "cache_hits":           len(cached_facts),
         "cache_short_circuit":  cache_short_circuit,
+        "upload_ids":           upload_ids,
         # Slice-3: prior analyses with overlapping scope. Empty list when no
         # match clears the threshold. Frontend renders these in a "Related
         # past analysis" panel above the new answer.

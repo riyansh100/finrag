@@ -12,15 +12,17 @@ import config
 from django.shortcuts import get_object_or_404
 from modes import DEFAULT_MODE, MODES, list_modes
 from rest_framework import status
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 
 import facts as facts_pipeline
 import nlu
 import recall as analysis_recall
+import uploads as upload_store
 
 from . import rag
-from .models import AnalysisNote, Chat, Message
+from .models import AnalysisNote, Chat, Message, UploadedDoc
 from .serializers import ChatDetailSerializer, ChatSerializer, MessageSerializer
 
 
@@ -105,6 +107,95 @@ def chat_detail(request, chat_id):
     return Response(ChatDetailSerializer(chat).data)
 
 
+def _upload_to_dict(u: UploadedDoc) -> dict:
+    return {
+        "id":           u.pk,
+        "chat_id":      u.chat_id,
+        "filename":     u.filename,
+        "pages":        u.pages,
+        "chunk_count":  u.chunk_count,
+        "status":       u.status,
+        "error":        u.error,
+        "created_at":   u.created_at.isoformat(),
+    }
+
+
+@api_view(["GET", "POST"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
+def chat_uploads(request, chat_id):
+    """GET  /api/chats/{id}/uploads        -> list of attached PDFs.
+    POST /api/chats/{id}/uploads        -> multipart upload, indexes the PDF
+        synchronously, returns the UploadedDoc row when ready.
+
+    Same file re-uploaded into the same chat is a no-op: we return the
+    existing row instead of re-indexing. PDFs > UPLOAD_MAX_MB are rejected
+    with 400. Failures leave a row with status=failed + error message."""
+    chat = get_object_or_404(Chat, pk=chat_id)
+
+    if request.method == "GET":
+        return Response([_upload_to_dict(u) for u in chat.uploads.all()])
+
+    f = request.FILES.get("file")
+    if f is None:
+        return Response(
+            {"detail": "Field 'file' (multipart) is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Size + MIME guard.
+    max_bytes = config.UPLOAD_MAX_MB * 1024 * 1024
+    if f.size > max_bytes:
+        return Response(
+            {"detail": f"File too large ({f.size} bytes); max is "
+                       f"{config.UPLOAD_MAX_MB} MB."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    name = f.name or "upload.pdf"
+    if not name.lower().endswith(".pdf"):
+        return Response(
+            {"detail": "Only .pdf files are accepted."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    file_bytes = f.read()
+    sha = upload_store.sha256_of(file_bytes)
+
+    # Per-chat dedup: same bytes, same chat -> return the existing row.
+    existing = chat.uploads.filter(sha256=sha).first()
+    if existing is not None:
+        return Response(_upload_to_dict(existing),
+                        status=status.HTTP_200_OK)
+
+    upload = UploadedDoc.objects.create(
+        chat=chat, filename=name, sha256=sha,
+        status=UploadedDoc.STATUS_PENDING,
+    )
+    try:
+        counters = upload_store.ingest_pdf(upload, file_bytes)
+        print(f"  [upload {upload.pk}] {name}: {counters}")
+    except Exception as e:
+        upload.status = UploadedDoc.STATUS_FAILED
+        upload.error = f"ingest: {type(e).__name__}: {str(e)[:200]}"
+        upload.save(update_fields=["status", "error", "updated_at"])
+
+    upload.refresh_from_db()
+    code = (status.HTTP_201_CREATED
+            if upload.status == UploadedDoc.STATUS_READY
+            else status.HTTP_400_BAD_REQUEST)
+    return Response(_upload_to_dict(upload), status=code)
+
+
+@api_view(["DELETE"])
+def chat_upload_detail(request, chat_id, upload_id):
+    """DELETE /api/chats/{id}/uploads/{upload_id}  -> drop Chroma collection,
+    stored PDF, and the row. Idempotent on partially-indexed uploads."""
+    chat = get_object_or_404(Chat, pk=chat_id)
+    upload = get_object_or_404(UploadedDoc, pk=upload_id, chat=chat)
+    upload_store.drop_upload(upload)
+    upload.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(["POST"])
 def message_create(request, chat_id):
     """POST /api/chats/{id}/messages  body: {"question": "..."}
@@ -136,9 +227,24 @@ def message_create(request, chat_id):
         .values("role", "content")[: config.HISTORY_TURNS]
     )[::-1]  # back to chronological order
 
+    # Optional list of UploadedDoc ids to search alongside the curated corpus.
+    # Validated against THIS chat -- no cross-chat upload access.
+    raw_upload_ids = body.get("upload_ids") or []
+    if not isinstance(raw_upload_ids, list):
+        return Response(
+            {"detail": "'upload_ids' must be a list of integers."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    valid_upload_ids = list(
+        chat.uploads.filter(
+            pk__in=raw_upload_ids, status=UploadedDoc.STATUS_READY,
+        ).values_list("pk", flat=True)
+    )
+
     user_msg = Message.objects.create(chat=chat, role=Message.USER, content=question)
 
-    result = rag.run_query(question, history=prior, mode=mode)
+    result = rag.run_query(question, history=prior, mode=mode,
+                           upload_ids=valid_upload_ids)
 
     assistant_msg = Message.objects.create(
         chat=chat,
@@ -153,16 +259,27 @@ def message_create(request, chat_id):
     # upsert into MetricFact (+ FactProvenance + AnalysisNote). Wrapped in a
     # broad try/except — the analytics pipeline MUST NEVER block or break the
     # user-facing answer flow.
+    # Slice-4: skip persistence when uploaded PDFs participated. Upload facts
+    # don't belong in the canonical MetricFact cache (they're per-chat,
+    # ephemeral relative to the curated corpus). This keeps cross-chat recall
+    # honest.
+    if valid_upload_ids:
+        print(f"  [facts] msg#{assistant_msg.pk}: skipped "
+              f"(upload-augmented answer)")
     try:
-        slots = result.get("slots") or {}
-        counters = facts_pipeline.process_assistant_message(
-            message=assistant_msg,
-            question=question,
-            answer=result["answer"],
-            sources=result["sources"],
-            slots=slots,
-            statement=slots.get("statement") or "",
-        )
+        if valid_upload_ids:
+            slots = {}
+            counters = {"extracted": 0}
+        else:
+            slots = result.get("slots") or {}
+            counters = facts_pipeline.process_assistant_message(
+                message=assistant_msg,
+                question=question,
+                answer=result["answer"],
+                sources=result["sources"],
+                slots=slots,
+                statement=slots.get("statement") or "",
+            )
         if counters.get("extracted"):
             print(f"  [facts] msg#{assistant_msg.pk}: "
                   f"{counters['extracted']} extracted -> "

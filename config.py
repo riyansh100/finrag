@@ -57,3 +57,13 @@ FACT_CACHE_ENABLED = True
 # RAG entirely -- the LLM gets only the synthetic cached-facts chunk and a
 # tiny set of source pages for citation context. Saves a full vector search.
 FACT_CACHE_SHORTCIRCUIT_RAG = True
+
+# On-the-fly PDF uploads -----------------------------------------------------
+# Uploaded PDFs land in UPLOAD_DIR/ and are indexed into a per-upload Chroma
+# collection named UPLOAD_CHROMA_PREFIX + "{id}". The curated `finrag` corpus
+# is never touched -- upload collections are merged in at retrieval time and
+# dropped when the parent chat is deleted.
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_MAX_MB = 25                          # reject larger PDFs at the endpoint
+UPLOAD_CHROMA_PREFIX = "upload_"
+UPLOAD_TOP_K = 6                            # chunks pulled from each upload per question

@@ -212,3 +212,61 @@ class AnalysisNote(models.Model):
         cos = ",".join(scope.get("companies") or []) or "?"
         per = ",".join(scope.get("periods") or []) or "?"
         return f"AnalysisNote[{self.mode}] {cos} / {per}"
+
+
+# ---------------------------------------------------------------------------
+# On-the-fly PDF uploads.
+#
+# A user can attach a PDF to a chat from the composer. The file is indexed
+# into its own ChromaDB collection (named UPLOAD_CHROMA_PREFIX + str(id)) and
+# stays available for the lifetime of the parent Chat. Deleting the Chat
+# cascade-deletes the UploadedDoc row; the cache.py-style cleanup hook in
+# uploads.py drops the underlying collection + file from disk.
+# ---------------------------------------------------------------------------
+
+
+class UploadedDoc(models.Model):
+    """A PDF uploaded into a single chat and indexed into its own Chroma
+    collection. NOT part of the curated `finrag` corpus."""
+
+    STATUS_PENDING = "pending"
+    STATUS_INDEXING = "indexing"
+    STATUS_READY = "ready"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING,  "Pending"),
+        (STATUS_INDEXING, "Indexing"),
+        (STATUS_READY,    "Ready"),
+        (STATUS_FAILED,   "Failed"),
+    ]
+
+    chat            = models.ForeignKey(
+        Chat, on_delete=models.CASCADE, related_name="uploads",
+    )
+    filename        = models.CharField(max_length=255)
+    # SHA-256 of file bytes, used for per-chat dedup. Same PDF re-uploaded into
+    # the same chat returns the existing row instead of re-indexing.
+    sha256          = models.CharField(max_length=64, db_index=True)
+    # Stored relative to config.UPLOAD_DIR. Kept on disk so we can re-index
+    # after a wipe of the vectorstore if ever needed.
+    stored_path     = models.CharField(max_length=512, blank=True, default="")
+    pages           = models.IntegerField(default=0)
+    chunk_count     = models.IntegerField(default=0)
+    collection_name = models.CharField(max_length=128, blank=True, default="")
+    status          = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING,
+    )
+    error           = models.TextField(blank=True, default="")
+    created_at      = models.DateTimeField(auto_now_add=True)
+    updated_at      = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["chat", "sha256"], name="uniq_chat_upload_sha",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Upload {self.pk}: {self.filename} ({self.status})"

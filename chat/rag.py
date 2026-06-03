@@ -71,10 +71,13 @@ def _build_flags(result):
     if result.get("recall"):
         flags.append(f"Recall → {len(result['recall'])} prior analysis "
                      f"match(es)")
+    if result.get("upload_ids"):
+        flags.append(f"Uploads → {len(result['upload_ids'])} "
+                     f"attached PDF(s) searched")
     return flags
 
 
-def run_query(question, history, mode=None):
+def run_query(question, history, mode=None, upload_ids=None):
     """Call the RAG pipeline and return JSON-able pieces.
 
     history: list of {"role", "content"} for THIS chat, already trimmed and
@@ -82,12 +85,17 @@ def run_query(question, history, mode=None):
     mode: optional mode id ("extract" | "analyze" | "compare"). When set, the
           shared cached LLM is NOT reused — ask() builds a per-mode LLM so
           temperature/prompt match the mode.
+    upload_ids: optional list of UploadedDoc ids attached to this turn. Each
+          one's per-upload Chroma collection is searched alongside the corpus.
     Returns: {"answer", "sources", "flags", "mode", "rewritten_query"}.
     """
+    upload_ids = list(upload_ids or [])
     if mode:
-        result = _ask(question, history=history, mode=mode)
+        result = _ask(question, history=history, mode=mode,
+                      upload_ids=upload_ids)
     else:
-        result = _ask(question, history=history, llm=get_llm())
+        result = _ask(question, history=history, llm=get_llm(),
+                      upload_ids=upload_ids)
     return {
         "answer": result["answer"],
         "sources": [_doc_to_dict(d) for d in result["sources"]],
@@ -99,4 +107,6 @@ def run_query(question, history, mode=None):
         "slots": result.get("slots") or {},
         # Slice-3: prior analyses with overlapping scope (already JSON-safe).
         "recall": result.get("recall") or [],
+        # Slice-4: which uploaded PDFs (if any) were searched for this turn.
+        "upload_ids": result.get("upload_ids") or [],
     }
