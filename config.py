@@ -7,7 +7,7 @@ VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 LLM_MODEL = "gpt-oss:20b-cloud"
 EMBEDDING_MODEL = "nomic-embed-text"
 VISION_MODEL = "granite3.2-vision:2b"   # ~2GB, document-focused; alternatives: "llama3.2-vision", "moondream"
-VISION_DPI = 144                        # render resolution for vision-model calls
+VISION_DPI = 96                       # render resolution for vision-model calls
 FIGURE_DESCRIPTIONS_ENABLED = False      # describe figures at ingest, store as type="figure" chunks
 FIGURE_MIN_IMAGE_PX = 200               # skip pages whose largest embedded image is smaller than this (likely logos)
 FIGURE_PROMPT = (
@@ -66,4 +66,15 @@ FACT_CACHE_SHORTCIRCUIT_RAG = True
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_MAX_MB = 25                          # reject larger PDFs at the endpoint
 UPLOAD_CHROMA_PREFIX = "upload_"
-UPLOAD_TOP_K = 6                            # chunks pulled from each upload per question
+UPLOAD_TOP_K = 12                           # chunks pulled from each upload per question
+# When the user attaches a PDF and asks a question, reserve at least this
+# fraction of MAX_CONTEXT_CHUNKS for upload chunks so the curated corpus
+# can't crowd them out (e.g. asking about "riyansh's project" while three
+# annual reports are also in scope).
+UPLOAD_CONTEXT_FRACTION = 0.66
+# Run the vision model on uploaded PDFs even when FIGURE_DESCRIPTIONS_ENABLED
+# is off globally. Uploads are focused docs the user explicitly chose, so
+# spending a few extra seconds per image-bearing page to get an architecture
+# diagram described is worth it. Requires the vision model to be pulled
+# locally (see config.VISION_MODEL).
+UPLOAD_FIGURE_DESCRIPTIONS = False    # vision model off for uploads -- text + tables only

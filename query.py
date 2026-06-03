@@ -1005,6 +1005,11 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
     flags, mode, and rewritten_query.
     """
     history = history or []
+    # Normalised once at the top so every downstream branch (rewriter skip,
+    # cache short-circuit gate, retrieval merge, return payload) sees the
+    # same shape.
+    upload_ids = list(upload_ids or [])
+    has_uploads = bool(upload_ids)
     mode_name = (mode or DEFAULT_MODE).lower()
     mode_cfg = get_mode(mode_name)
     # Per-mode LLM (lets analyze/compare use a different temperature later).
@@ -1025,7 +1030,16 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         ("human", "{question}"),
     ])
 
-    rewritten = rewrite_query(question, history, llm=llm)
+    # When uploads are attached, skip the rewriter entirely. The upload
+    # chips already tell us what the user is asking about; the LLM rewriter
+    # tends to drag in entities from the LAST chat turn ("describe the
+    # architecture diagram" -> rewritten to last turn's "compare riyansh
+    # vs prakarsh" because the rewriter saw that in history). The original
+    # question is fine -- it'll hit the upload's BM25/vector index directly.
+    if has_uploads:
+        rewritten = question
+    else:
+        rewritten = rewrite_query(question, history, llm=llm)
     # Run filter detection over BOTH the original and the rewritten query so
     # rewriter-induced spelling drift doesn't lose a real author match.
     all_sources = detect_all_sources(question, rewritten)
@@ -1080,11 +1094,10 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
     cache_short_circuit = False
     cached_chunk = None
     # Uploads are not in MetricFact, so the cache can NEVER fully cover a
-    # question that depends on uploaded content. Disable short-circuit
-    # whenever a PDF is attached -- we still consult the cache for any
-    # curated-corpus facts that might overlap, but RAG always runs.
-    upload_ids = list(upload_ids or [])
-    has_uploads = bool(upload_ids)
+    # question that depends on uploaded content. has_uploads (set above)
+    # is consulted below to disable the short-circuit -- we still consult
+    # the cache for any curated-corpus facts that might overlap, but RAG
+    # always runs.
     try:
         slots_for_cache = {
             "companies": sorted(all_companies),
@@ -1149,17 +1162,81 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         head = []
         if cached_chunk is not None:
             head.append(cached_chunk)
-        head.extend(_dedupe(upload_docs))
-        docs = head + docs
+        # Reserve a majority of the context window for upload chunks whenever
+        # uploads are attached. Without this reservation the curated corpus
+        # (which is bigger + has more "project"/"revenue" hits) drowns out
+        # the attached PDF and the LLM answers from corpus content the user
+        # didn't ask about. The remainder of the window is filled with
+        # corpus hits so cross-document questions still work.
+        upload_dedup = _dedupe(upload_docs)
+        if has_uploads and upload_dedup:
+            reserve = max(
+                len(upload_dedup),
+                int(config.MAX_CONTEXT_CHUNKS * config.UPLOAD_CONTEXT_FRACTION),
+            )
+            upload_part = upload_dedup[:reserve]
+            head.extend(upload_part)
+            corpus_budget = max(0,
+                config.MAX_CONTEXT_CHUNKS - len(head)
+            )
+            docs = head + docs[:corpus_budget]
+        else:
+            head.extend(upload_dedup)
+            docs = head + docs
         docs = docs[:config.MAX_CONTEXT_CHUNKS]
     context = format_context(docs)
 
+    # When the user explicitly attached a PDF, prepend a one-line steer to the
+    # question so the LLM treats those chunks as the primary subject. Cheap
+    # and reversible -- if the question is plainly about the corpus, the LLM
+    # still has corpus chunks in context to draw from.
+    asked = question
+    if has_uploads and upload_docs:
+        attached_names = sorted({
+            d.metadata.get("source", "") for d in upload_docs
+            if d.metadata.get("source")
+        })
+        if attached_names:
+            asked = (
+                f"(The user has attached the following PDF(s) to this chat: "
+                f"{', '.join(attached_names)}. Treat those as the primary "
+                f"document(s) the question is about, unless the question "
+                f"explicitly names another company/document in the corpus.)\n\n"
+                f"{question}"
+            )
+
     chain = mode_prompt | llm | StrOutputParser()
-    answer = chain.invoke({
-        "context": context,
-        "history": _history_to_messages(history),
-        "question": question,  # original — keeps tone natural
-    })
+    try:
+        answer = chain.invoke({
+            "context": context,
+            "history": _history_to_messages(history),
+            "question": asked,
+        })
+    except Exception as e:
+        # Most common failure mode is the LLM endpoint being unreachable
+        # (Ollama cloud 502, local daemon not running, model not pulled).
+        # Surface a clean message instead of letting Django render a 500 page
+        # the user can't act on. Retrieval already ran, so we keep `docs` for
+        # the Sources panel -- the answer slot just carries the error.
+        err_name = type(e).__name__
+        err_text = str(e)[:300]
+        print(f"  [llm] call failed: {err_name}: {err_text}")
+        if "unreachable" in err_text or "502" in err_text or "Connection" in err_text:
+            answer = (
+                f"⚠️ The language model is unreachable right now.\n\n"
+                f"Model: `{config.LLM_MODEL}`. If this name ends in "
+                f"`-cloud`, the request was routed through Ollama's hosted "
+                f"endpoint (ollama.com) and the connection failed. "
+                f"Check your network, or switch `LLM_MODEL` in `config.py` "
+                f"to a locally-pulled model (e.g. `llama3.1:8b`) and "
+                f"restart the server.\n\n"
+                f"Raw error: `{err_name}: {err_text}`"
+            )
+        else:
+            answer = (
+                f"⚠️ The language model call failed: "
+                f"`{err_name}: {err_text}`."
+            )
     # Unified slot dict for downstream consumers (fact extractor, analytics
     # layer). Mirrors what NLU produced when it succeeded, but is also
     # populated by the regex fallback path so callers don't need to care

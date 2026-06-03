@@ -101,15 +101,27 @@ def ingest_pdf(upload, file_bytes: bytes) -> dict:
         "is_upload":  True,
     }
 
+    # Vision-model figure descriptions are off by default for the curated
+    # corpus (too slow at scale), but on for uploads -- the user uploaded
+    # this PDF specifically, so we trade a few seconds per image-bearing
+    # page for the ability to answer "describe this diagram". load_pdf reads
+    # config.FIGURE_DESCRIPTIONS_ENABLED at call time, so we toggle it under
+    # try/finally and restore the original value regardless of outcome.
+    _saved_fig_flag = config.FIGURE_DESCRIPTIONS_ENABLED
+    if config.UPLOAD_FIGURE_DESCRIPTIONS:
+        config.FIGURE_DESCRIPTIONS_ENABLED = True
     try:
-        text_docs, table_docs, figure_docs, counts = load_pdf(
-            Path(stored), doc_meta=doc_meta,
-        )
-    except Exception as e:
-        upload.status = upload.STATUS_FAILED
-        upload.error = f"load_pdf: {type(e).__name__}: {str(e)[:200]}"
-        upload.save(update_fields=["status", "error", "updated_at"])
-        return {"chunks": 0, "pages": 0, "error": upload.error}
+        try:
+            text_docs, table_docs, figure_docs, counts = load_pdf(
+                Path(stored), doc_meta=doc_meta,
+            )
+        except Exception as e:
+            upload.status = upload.STATUS_FAILED
+            upload.error = f"load_pdf: {type(e).__name__}: {str(e)[:200]}"
+            upload.save(update_fields=["status", "error", "updated_at"])
+            return {"chunks": 0, "pages": 0, "error": upload.error}
+    finally:
+        config.FIGURE_DESCRIPTIONS_ENABLED = _saved_fig_flag
 
     pages = max((d.metadata.get("page", 0) for d in text_docs), default=0)
     upload.pages = pages
@@ -173,17 +185,27 @@ def ingest_pdf(upload, file_bytes: bytes) -> dict:
 def drop_upload(upload) -> None:
     """Tear down everything an upload owns: Chroma collection, stored file,
     parent dir. Idempotent -- safe to call on a row that never finished
-    indexing. The DB row itself is deleted by the caller (or by cascade)."""
+    indexing. The DB row itself is deleted by the caller (or by cascade).
+
+    Every step is wrapped independently so a failure on one (e.g. Chroma
+    collection already gone) doesn't block the rest. This is the cleanup
+    path that runs on Chat cascade-delete via the pre_delete signal -- it
+    MUST tolerate partially-indexed / inconsistent rows."""
     coll = upload.collection_name or collection_name_for(upload.pk)
+    # Use the lower-level chromadb client to avoid building an Ollama-backed
+    # Chroma() instance just to drop a collection. Spinning up the embedding
+    # function for a teardown is wasteful and a known crash surface (Ollama
+    # not running -> 500). Falls back to the Chroma() path only if needed.
     try:
-        vs = Chroma(
-            collection_name=coll,
-            embedding_function=_get_embeddings(),
-            persist_directory=str(config.VECTORSTORE_DIR),
-        )
-        vs.delete_collection()
+        import chromadb
+        client = chromadb.PersistentClient(path=str(config.VECTORSTORE_DIR))
+        try:
+            client.delete_collection(coll)
+        except Exception:
+            # Collection may already be gone -- treat as success.
+            pass
     except Exception as e:
-        print(f"  [upload {upload.pk}] drop_collection failed: "
+        print(f"  [upload {upload.pk}] drop_collection (client) failed: "
               f"{type(e).__name__}: {str(e)[:120]}")
 
     if upload.stored_path:
@@ -211,15 +233,36 @@ def retrieve_from_uploads(question: str, upload_ids, k: int = None):
     for uid in upload_ids:
         try:
             vs = open_upload_collection(uid)
-            retriever = vs.as_retriever(
-                search_type="mmr",
-                search_kwargs={
-                    "k": k,
-                    "fetch_k": max(config.MMR_FETCH_K, k * 3),
-                    "lambda_mult": config.MMR_LAMBDA,
-                },
-            )
-            out.extend(retriever.invoke(question))
+            # MMR over a tiny collection (e.g. one-page PDF) sometimes throws
+            # inside Chroma because fetch_k > collection size. Cap fetch_k
+            # against the actual row count and fall back to similarity if MMR
+            # still complains.
+            try:
+                count = vs._collection.count()
+            except Exception:
+                count = 0
+            if count == 0:
+                continue
+            safe_k = min(k, count)
+            safe_fetch = min(max(config.MMR_FETCH_K, safe_k * 3), count)
+            try:
+                retriever = vs.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={
+                        "k": safe_k,
+                        "fetch_k": safe_fetch,
+                        "lambda_mult": config.MMR_LAMBDA,
+                    },
+                )
+                out.extend(retriever.invoke(question))
+            except Exception as mmr_err:
+                print(f"  [upload {uid}] mmr failed, similarity fallback: "
+                      f"{type(mmr_err).__name__}: {str(mmr_err)[:100]}")
+                retriever = vs.as_retriever(
+                    search_type="similarity",
+                    search_kwargs={"k": safe_k},
+                )
+                out.extend(retriever.invoke(question))
         except Exception as e:
             print(f"  [upload {uid}] retrieve failed: "
                   f"{type(e).__name__}: {str(e)[:120]}")

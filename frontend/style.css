@@ -510,6 +510,117 @@ html, body {
 .recall-action.primary:hover { filter: brightness(1.1); }
 .recall-action:disabled { opacity: 0.5; cursor: default; }
 
+/* --- Slice-4: attach button + uploaded-PDF chips ------------------------- */
+#attach-btn {
+  padding: 0 12px;
+  border-radius: 5px;
+  border: 1px solid var(--border-2);
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+#attach-btn:hover:not(:disabled) {
+  color: var(--amber);
+  border-color: var(--amber-dim);
+  background: rgba(245, 166, 35, 0.05);
+}
+#attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Strip of upload chips that sits ABOVE the composer when the active chat
+   has any attached PDFs. */
+#attached-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+#attached-strip[hidden] { display: none; }
+
+.upload-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 9px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  border-left: 2px solid var(--cyan);
+  border-radius: 4px;
+  max-width: 320px;
+}
+.upload-chip.pending  { border-left-color: var(--amber); color: var(--text-dim); }
+.upload-chip.failed   { border-left-color: var(--red);   color: var(--red); }
+
+.upload-chip .name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+.upload-chip .meta {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.upload-chip .remove {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 4px;
+  line-height: 1;
+}
+.upload-chip .remove:hover { color: var(--red); }
+.upload-chip .spinner {
+  display: inline-block;
+  width: 10px; height: 10px;
+  border: 1.5px solid var(--border-2);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: chip-spin 0.7s linear infinite;
+}
+@keyframes chip-spin { to { transform: rotate(360deg); } }
+
+/* Drag-and-drop overlay covers the message pane while a file is over it. */
+#dropzone-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 14, 20, 0.85);
+  border: 2px dashed var(--amber-dim);
+  border-radius: 8px;
+  margin: 16px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+  z-index: 20;
+}
+#main { position: relative; }
+#dropzone-overlay.dragover { opacity: 1; }
+.dropzone-card {
+  text-align: center;
+  font-family: var(--mono);
+  color: var(--amber);
+}
+.dropzone-icon {
+  font-size: 36px;
+  line-height: 1;
+  margin-bottom: 8px;
+}
+.dropzone-text {
+  font-size: 13px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
 /* scrollbars */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: var(--bg); }

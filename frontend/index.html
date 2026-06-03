@@ -27,10 +27,27 @@
         <!-- message bubbles injected by app.js -->
       </div>
 
+      <!-- Drag-and-drop overlay shown while a PDF is being dragged over the
+           message pane. Pointer-events:none until .dragover is added. -->
+      <div id="dropzone-overlay">
+        <div class="dropzone-card">
+          <div class="dropzone-icon">+</div>
+          <div class="dropzone-text">Drop PDF to attach to this chat</div>
+        </div>
+      </div>
+
+      <!-- Strip of attached-upload chips, rendered just above the composer
+           when this chat has any uploads. Hidden when empty. -->
+      <div id="attached-strip" hidden></div>
+
       <form id="composer" autocomplete="off">
         <select id="mode-select" title="Answer mode" disabled>
           <!-- populated by app.js from /api/modes -->
         </select>
+        <!-- Hidden native file input; the visible paperclip triggers click() -->
+        <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
+        <button id="attach-btn" type="button"
+                title="Attach a PDF to this chat" disabled>📎</button>
         <input
           id="question-input"
           type="text"

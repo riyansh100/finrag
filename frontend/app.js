@@ -32,6 +32,11 @@ function renderMarkdown(text) {
 let activeChatId = null;     // which chat is open in the message pane
 let modes = [];              // [{id,label,description}] from /api/modes
 let defaultMode = "extract"; // fallback if /api/modes hasn't loaded yet
+// Slice-4: uploads attached to the active chat. Re-fetched on openChat().
+// Shape: [{id, filename, status, pages, chunk_count, error, ...}]. Pending
+// uploads (mid-fetch) are spliced in optimistically with status="indexing"
+// and a client-only `_localId` for re-render targeting.
+let activeUploads = [];
 
 // --- API calls ---------------------------------------------------------------
 async function api(path, options = {}) {
@@ -51,12 +56,35 @@ const listChats = () => api("/chats");
 const createChat = () => api("/chats", { method: "POST", body: "{}" });
 const getChat = (id) => api(`/chats/${id}`);
 const deleteChat = (id) => api(`/chats/${id}`, { method: "DELETE" });
-const postMessage = (id, question, mode) =>
+const postMessage = (id, question, mode, uploadIds) =>
   api(`/chats/${id}/messages`, {
     method: "POST",
-    body: JSON.stringify({ question, mode }),
+    body: JSON.stringify({
+      question, mode,
+      upload_ids: uploadIds && uploadIds.length ? uploadIds : undefined,
+    }),
   });
 const getNote = (id) => api(`/notes/${id}`);
+
+// Slice-4 uploads. Multipart POST goes through fetch directly (api() forces
+// JSON content-type which breaks multipart boundary detection).
+const listUploads  = (chatId) => api(`/chats/${chatId}/uploads`);
+const deleteUpload = (chatId, uploadId) =>
+  api(`/chats/${chatId}/uploads/${uploadId}`, { method: "DELETE" });
+async function uploadPdf(chatId, file) {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  const res = await fetch(`${API}/chats/${chatId}/uploads`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await res.json().catch(() => ({}));
+  // 200 = dedup hit (same file already attached), 201 = freshly indexed.
+  if (!res.ok && res.status !== 200) {
+    throw new Error(body.detail || `${res.status} ${res.statusText}`);
+  }
+  return body;
+}
 
 // --- mode dropdown -----------------------------------------------------------
 function populateModeSelect() {
@@ -97,6 +125,8 @@ async function refreshSidebar() {
         activeChatId = null;
         clearMessages();
         setComposerEnabled(false);
+        activeUploads = [];
+        renderAttachedStrip();
       }
       refreshSidebar();
     });
@@ -248,11 +278,145 @@ function scrollToBottom() {
   m.scrollTop = m.scrollHeight;
 }
 
+// --- Slice-4: uploads UI -----------------------------------------------------
+// The composer has a paperclip + drag-drop on the message pane. Each upload
+// becomes a chip in #attached-strip. Chips render in three states:
+//   indexing  -> spinner, no remove (we're still POST'ing)
+//   ready     -> coloured chip, ✕ removes from chat
+//   failed    -> red chip showing the error message
+// On send, every READY upload's id is sent in the message body so the backend
+// merges that PDF's per-upload Chroma collection with the corpus retrieval.
+
+function renderAttachedStrip() {
+  const strip = $("#attached-strip");
+  strip.innerHTML = "";
+  if (!activeUploads.length) { strip.hidden = true; return; }
+  strip.hidden = false;
+
+  activeUploads.forEach((u) => {
+    const chip = el("div", `upload-chip ${u.status || "ready"}`);
+
+    if (u.status === "indexing" || u.status === "pending") {
+      chip.appendChild(el("span", "spinner"));
+    }
+    const name = el("span", "name");
+    name.textContent = u.filename;
+    name.title = u.filename;
+    chip.appendChild(name);
+
+    if (u.status === "ready") {
+      const meta = el("span", "meta");
+      meta.textContent = `${u.pages}p · ${u.chunk_count}c`;
+      chip.appendChild(meta);
+    } else if (u.status === "indexing" || u.status === "pending") {
+      const meta = el("span", "meta");
+      meta.textContent = "indexing…";
+      chip.appendChild(meta);
+    } else if (u.status === "failed") {
+      const meta = el("span", "meta");
+      meta.textContent = (u.error || "failed").slice(0, 60);
+      meta.title = u.error || "failed";
+      chip.appendChild(meta);
+    }
+
+    // Remove button: only meaningful for rows that have a server-side id
+    // (i.e. not the optimistic pending placeholder before POST returns).
+    if (u.id !== undefined) {
+      const rm = el("button", "remove");
+      rm.type = "button";
+      rm.textContent = "✕";
+      rm.title = "Detach this PDF from the chat";
+      rm.addEventListener("click", () => removeUpload(u.id));
+      chip.appendChild(rm);
+    }
+
+    strip.appendChild(chip);
+  });
+}
+
+async function refreshAttachedStrip() {
+  if (!activeChatId) { activeUploads = []; renderAttachedStrip(); return; }
+  try {
+    activeUploads = await listUploads(activeChatId) || [];
+  } catch (e) {
+    console.error("listUploads failed:", e);
+    activeUploads = [];
+  }
+  renderAttachedStrip();
+}
+
+async function handleFileSelected(file) {
+  if (!file) return;
+  if (!/\.pdf$/i.test(file.name)) {
+    alert("Only PDF files can be attached.");
+    return;
+  }
+  // Ensure we have a chat to attach into. If the user hasn't opened/created
+  // one yet, mint one now so the upload has a home.
+  if (!activeChatId) {
+    const chat = await createChat();
+    activeChatId = chat.id;
+    await refreshSidebar();
+  }
+
+  // Optimistic placeholder chip while the server indexes the PDF.
+  const localId = `local-${Date.now()}`;
+  activeUploads.push({
+    _localId: localId,
+    filename: file.name,
+    status: "indexing",
+  });
+  renderAttachedStrip();
+
+  try {
+    const row = await uploadPdf(activeChatId, file);
+    // Replace the placeholder with the real row (or merge — backend may have
+    // returned an existing dedup hit). Drop placeholder by _localId.
+    activeUploads = activeUploads.filter((u) => u._localId !== localId);
+    // If the same upload id is already in the list (dedup), don't duplicate.
+    if (!activeUploads.some((u) => u.id === row.id)) {
+      activeUploads.push(row);
+    }
+  } catch (err) {
+    console.error("upload failed:", err);
+    const placeholder = activeUploads.find((u) => u._localId === localId);
+    if (placeholder) {
+      placeholder.status = "failed";
+      placeholder.error = err.message || "upload failed";
+    }
+  }
+  renderAttachedStrip();
+}
+
+async function removeUpload(uploadId) {
+  if (!activeChatId) return;
+  // Optimistic remove — restore on error.
+  const before = activeUploads;
+  activeUploads = activeUploads.filter((u) => u.id !== uploadId);
+  renderAttachedStrip();
+  try {
+    await deleteUpload(activeChatId, uploadId);
+  } catch (e) {
+    console.error("deleteUpload failed:", e);
+    activeUploads = before;
+    renderAttachedStrip();
+  }
+}
+
+function readyUploadIds() {
+  return activeUploads
+    .filter((u) => u.status === "ready" && u.id !== undefined)
+    .map((u) => u.id);
+}
+
 // --- actions -----------------------------------------------------------------
 async function openChat(id) {
   activeChatId = id;
   setComposerEnabled(true);
   await refreshSidebar();
+  // Load the chat's attached PDFs in parallel with the message list -- they
+  // both come from the same chat and the user expects to see them together.
+  refreshAttachedStrip();
 
   const chat = await getChat(id);
   $("#messages").innerHTML = "";
@@ -279,8 +443,12 @@ async function sendQuestion(question) {
   if (!activeChatId) {
     const chat = await createChat();
     activeChatId = chat.id;
+    refreshAttachedStrip();
   }
   const mode = $("#mode-select").value || defaultMode;
+  // Send every READY upload attached to this chat. The backend re-validates
+  // against UploadedDoc.status so anything mid-index is silently ignored.
+  const uploadIds = readyUploadIds();
 
   addMessage({ role: "user", content: question });
 
@@ -289,7 +457,7 @@ async function sendQuestion(question) {
 
   setComposerEnabled(false);
   try {
-    const res = await postMessage(activeChatId, question, mode);
+    const res = await postMessage(activeChatId, question, mode, uploadIds);
     pending.remove();
     // Recall first (above the new answer) so the user sees "we have prior
     // work on this" before the new answer they're about to read.
@@ -310,6 +478,7 @@ function setComposerEnabled(enabled) {
   $("#question-input").disabled = !enabled;
   $("#send-btn").disabled = !enabled;
   $("#mode-select").disabled = !enabled || modes.length === 0;
+  $("#attach-btn").disabled = !enabled;
 }
 
 // --- wire up events ----------------------------------------------------------
@@ -322,6 +491,53 @@ $("#composer").addEventListener("submit", (e) => {
   if (!q) return;
   input.value = "";
   sendQuestion(q);
+});
+
+// --- Slice-4: attach button + drag-drop -------------------------------------
+$("#attach-btn").addEventListener("click", () => $("#file-input").click());
+$("#file-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";  // allow re-picking the same file
+  if (file) handleFileSelected(file);
+});
+
+// Drag-and-drop on the message pane. We toggle a class on the overlay so it
+// fades in only while a real drag is in progress. dragleave fires on every
+// child boundary, so we track the depth with a counter.
+let _dragDepth = 0;
+const dropOverlay = $("#dropzone-overlay");
+const mainPane = $("#main");
+
+function _isFileDrag(e) {
+  return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+}
+
+mainPane.addEventListener("dragenter", (e) => {
+  if (!_isFileDrag(e)) return;
+  e.preventDefault();
+  _dragDepth++;
+  dropOverlay.classList.add("dragover");
+});
+mainPane.addEventListener("dragover", (e) => {
+  if (!_isFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+});
+mainPane.addEventListener("dragleave", (e) => {
+  if (!_isFileDrag(e)) return;
+  _dragDepth--;
+  if (_dragDepth <= 0) {
+    _dragDepth = 0;
+    dropOverlay.classList.remove("dragover");
+  }
+});
+mainPane.addEventListener("drop", (e) => {
+  if (!_isFileDrag(e)) return;
+  e.preventDefault();
+  _dragDepth = 0;
+  dropOverlay.classList.remove("dragover");
+  const file = e.dataTransfer.files[0];
+  if (file) handleFileSelected(file);
 });
 
 // --- init --------------------------------------------------------------------
