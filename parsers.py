@@ -75,6 +75,50 @@ PARSERS = {
 }
 
 
+# --- generic detector for on-the-fly uploads -------------------------------
+#
+# Uploads aren't filed into a `data/<company>/` folder, so PARSERS can't
+# resolve them. We still WANT to stamp a period on the chunks so the LLM
+# doesn't hallucinate fiscal years from raw page text. This best-effort
+# detector tries the same patterns we already support and returns whatever
+# matches (company may be left blank — we only commit to a period).
+
+
+def detect_upload_meta(filename: str) -> dict:
+    """Return a best-effort metadata dict for an ad-hoc upload filename.
+
+    Currently understands:
+      - `q1-2018.pdf` style                -> period=Q1FY18 (Indian FY convention)
+      - `Annual-Report-2024-25.pdf` style  -> period=FY25
+
+    Anything else returns an empty stub (no period stamp). Never raises.
+    """
+    name = (filename or "").strip()
+    # Infosys-style quarterly
+    m = _INFOSYS_RE.match(name)
+    if m:
+        quarter = int(m.group(1))
+        fy = int(m.group(2)) % 100
+        return {
+            "doc_type": "quarterly",
+            "period":   f"Q{quarter}FY{fy:02d}",
+            "quarter":  quarter,
+            "fy":       fy,
+        }
+    # Annual-report-style
+    m = _RIIL_ANNUAL_RE.match(name)
+    if m:
+        end_year = int(m.group(2))
+        fy = end_year if end_year < 100 else end_year % 100
+        return {
+            "doc_type": "annual",
+            "period":   f"FY{fy:02d}",
+            "quarter":  None,
+            "fy":       fy,
+        }
+    return {}
+
+
 def parse_filename(company_folder, filename):
     """Look up the company's parsers and return metadata, or None on no match.
 

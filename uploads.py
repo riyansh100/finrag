@@ -24,11 +24,13 @@ import shutil
 from pathlib import Path
 
 from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document as _Doc
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
 from embeddings import make_embeddings
 from ingest import load_pdf
+from parsers import detect_upload_meta
 
 
 # Embedder is built once and shared across uploads (same as the main corpus
@@ -93,11 +95,17 @@ def ingest_pdf(upload, file_bytes: bytes) -> dict:
 
     # Tag every chunk so retrieval can attribute it back to the upload and the
     # frontend can render an "uploaded" badge in the Sources panel.
+    # Best-effort filename detection stamps a period (e.g. "Q1FY18") so the
+    # LLM has a structured anchor instead of guessing the FY from raw text.
+    detected = detect_upload_meta(upload.filename)
     doc_meta = {
         "upload_id":  upload.pk,
         "chat_id":    upload.chat_id,
         "company":    "",     # leave the curated-corpus company slug empty
-        "period":     "",
+        "period":     detected.get("period") or "",
+        "quarter":    detected.get("quarter"),
+        "fy":         detected.get("fy"),
+        "doc_type":   detected.get("doc_type") or "",
         "is_upload":  True,
     }
 
@@ -220,8 +228,42 @@ def drop_upload(upload) -> None:
 
 # --- retrieval helpers (called from query.py) -------------------------------
 
-def retrieve_from_uploads(question: str, upload_ids, k: int = None):
+# Statement-anchor probes -- same idea as the corpus retriever, but used per
+# upload. When the question is about a specific financial statement, the
+# literal keyword-matching tends to lose to "tangentially related" pages
+# (e.g. a ratio-analysis page beats the actual balance-sheet page for "balance
+# sheet data" because the former says "current ratio" and the latter is mostly
+# numbers). The anchor probe pulls the page that contains the statement's
+# signature line items, guaranteeing it lands in context.
+_UPLOAD_ANCHORS = {
+    "balance sheet": (
+        "Total assets Total equity Total liabilities "
+        "Cash and cash equivalents Trade receivables "
+        "Property plant and equipment shareholders equity"
+    ),
+    "profit and loss": (
+        "Revenues Cost of sales Gross profit Operating profit "
+        "Net profit Basic EPS earnings per share"
+    ),
+    "cash flow": (
+        "Cash flow from operating activities investing "
+        "financing activities net increase decrease in cash"
+    ),
+    "changes in equity": (
+        "Statement of changes in equity share capital reserves"
+    ),
+}
+
+
+def retrieve_from_uploads(question: str, upload_ids, k: int = None,
+                          statement_targets=None):
     """Pull up to `k` chunks from each of the given upload collections, merged.
+
+    statement_targets: optional iterable of statement keywords (e.g.
+        {"balance sheet"}) detected from the question. For each one we run an
+        extra anchor probe so the page containing the signature rows ALWAYS
+        lands in context, even when literal keyword similarity favours a
+        different page.
 
     Returns a flat list of LangChain Documents. Empty list if no uploads or
     every collection lookup fails -- never raises.
@@ -229,14 +271,11 @@ def retrieve_from_uploads(question: str, upload_ids, k: int = None):
     if not upload_ids:
         return []
     k = k or config.UPLOAD_TOP_K
+    statement_targets = set(statement_targets or [])
     out = []
     for uid in upload_ids:
         try:
             vs = open_upload_collection(uid)
-            # MMR over a tiny collection (e.g. one-page PDF) sometimes throws
-            # inside Chroma because fetch_k > collection size. Cap fetch_k
-            # against the actual row count and fall back to similarity if MMR
-            # still complains.
             try:
                 count = vs._collection.count()
             except Exception:
@@ -244,25 +283,60 @@ def retrieve_from_uploads(question: str, upload_ids, k: int = None):
             if count == 0:
                 continue
             safe_k = min(k, count)
-            safe_fetch = min(max(config.MMR_FETCH_K, safe_k * 3), count)
-            try:
-                retriever = vs.as_retriever(
-                    search_type="mmr",
-                    search_kwargs={
-                        "k": safe_k,
-                        "fetch_k": safe_fetch,
-                        "lambda_mult": config.MMR_LAMBDA,
-                    },
-                )
-                out.extend(retriever.invoke(question))
-            except Exception as mmr_err:
-                print(f"  [upload {uid}] mmr failed, similarity fallback: "
-                      f"{type(mmr_err).__name__}: {str(mmr_err)[:100]}")
-                retriever = vs.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": safe_k},
-                )
-                out.extend(retriever.invoke(question))
+            # SIMILARITY, not MMR. MMR adds non-determinism (re-running the
+            # same question can return a different chunk set when scores tie),
+            # which produced the "ratio table wasn't there, then was" bug.
+            # The user uploaded a focused doc -- we want the top-k by cosine
+            # similarity, same every time.
+            retriever = vs.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": safe_k},
+            )
+            base_hits = retriever.invoke(question)
+            out.extend(base_hits)
+
+            # Anchor probes per detected statement target. For each one we run
+            # a SECOND similarity pass with a probe rich in that statement's
+            # signature rows, then promote every chunk from the matched page
+            # (table extraction often splits one balance sheet across multiple
+            # chunks; pulling the whole page guarantees the totals row is in
+            # context even if it's in a different sub-chunk than the line
+            # items the question asked about).
+            if statement_targets:
+                # Pre-load all chunks of this collection once so we can do
+                # cheap page-level lookups for the "whole page" promotion.
+                try:
+                    res = vs.get()
+                    all_in_coll = [
+                        (d, m or {})
+                        for d, m in zip(res["documents"], res["metadatas"])
+                    ]
+                except Exception:
+                    all_in_coll = []
+
+                for stmt in statement_targets:
+                    probe = _UPLOAD_ANCHORS.get(stmt)
+                    if not probe:
+                        continue
+                    try:
+                        anchor_hits = vs.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={"k": min(4, count)},
+                        ).invoke(probe)
+                    except Exception:
+                        anchor_hits = []
+                    out.extend(anchor_hits)
+                    # Promote every chunk from anchor pages so split tables
+                    # are fully visible.
+                    anchor_pages = {
+                        (h.metadata.get("source"), h.metadata.get("page"))
+                        for h in anchor_hits
+                    }
+                    if anchor_pages and all_in_coll:
+                        for content, meta in all_in_coll:
+                            key = (meta.get("source"), meta.get("page"))
+                            if key in anchor_pages:
+                                out.append(_Doc(content, meta))
         except Exception as e:
             print(f"  [upload {uid}] retrieve failed: "
                   f"{type(e).__name__}: {str(e)[:120]}")

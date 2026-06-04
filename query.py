@@ -304,6 +304,9 @@ _QUARTER_PATTERNS = [
     # third quarter of FY24 / third quarter of 2024
     re.compile(r"\b(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(?:fy\s*)?(\d{2,4})\b",
                re.IGNORECASE),
+    # "quarter 1 in 2018" / "quarter 1 of 2018" / "quarter 1 for FY18"
+    re.compile(r"\bquarter\s+([1-4])\s+(?:in|of|for)\s+(?:fy\s*)?(\d{2,4})\b",
+               re.IGNORECASE),
 ]
 
 _ANNUAL_PATTERNS = [
@@ -345,6 +348,45 @@ def _normalize_fy(year_str):
     return y if y < 100 else y % 100
 
 
+# When the user writes "compare Q1 2018 with 2019", the trailing "2019" has no
+# quarter prefix, but a comparator + a leading Q+year mean it should inherit
+# the same quarter. Same for "Q1 FY24 vs FY25" -- although that one is caught
+# by detect_periods's normal quarterly + annual paths.
+_BARE_YEAR_RE = re.compile(r"\bfy\s*(\d{2,4})\b|\b((?:19|20)\d{2})\b",
+                           re.IGNORECASE)
+
+
+def _promote_bare_years(periods, *questions):
+    """If exactly one quarter+year was detected AND a comparator is present
+    AND there are additional bare years in the text, promote those bare years
+    to the same quarter. Conservative: only fires when there's exactly one
+    quarter to inherit from (avoids ambiguity with multi-quarter ranges)."""
+    quarterly = [p for p in periods if p.startswith("Q")]
+    if len(quarterly) != 1:
+        return periods
+    # The single quarter we'll lift.
+    q_label = quarterly[0]
+    m = _PERIOD_LABEL_RE.match(q_label)
+    if not m or not m.group(1):
+        return periods
+    quarter = int(m.group(1))
+    base_fy = int(m.group(2))
+    # Does the text have a comparator?
+    if not any(_RANGE_CONNECTOR_RE.search(q or "") for q in questions):
+        return periods
+    extra = set()
+    for q in questions:
+        if not q:
+            continue
+        for bm in _BARE_YEAR_RE.finditer(q):
+            year_str = bm.group(1) or bm.group(2)
+            fy = _normalize_fy(year_str)
+            if fy == base_fy:
+                continue
+            extra.add(f"Q{quarter}FY{fy:02d}")
+    return periods | extra if extra else periods
+
+
 def detect_periods(*questions):
     """Return the set of canonical period labels (e.g. {'Q3FY24'}, {'FY25'},
     {'Q1FY25','Q2FY25'}) the question mentions. Quarterly hits take precedence
@@ -381,7 +423,8 @@ def detect_period_filter(question, *extra_questions):
 # every intervening period gets a fan-out slot. Without this, "FY24 to FY26"
 # only pulls FY24 + FY26 and silently drops FY25.
 _RANGE_CONNECTOR_RE = re.compile(
-    r"\b(from|to|through|across|between|vs\.?|versus|till|until)\b",
+    r"\b(from|to|through|across|between|vs\.?|versus|till|until|"
+    r"with|compared?|compare\s+to|and)\b",
     re.IGNORECASE,
 )
 
@@ -447,6 +490,74 @@ _NUMERIC_KEYWORDS = {
     "percentage", "growth", "yoy", "quarter", "fy", "year", "annual",
     "how", "much", "many", "number", "count",
 }
+
+
+# Common misspellings users have hit in prompts. Lightweight bag of token
+# substitutions applied before regex slot detection. Kept tiny on purpose --
+# this is not a spellchecker, just a safety net for the typos that have
+# actually broken routing in production.
+_TYPO_FIXES = [
+    (re.compile(r"\brations?\b",        re.IGNORECASE), "ratio"),
+    (re.compile(r"\bbalanced\s+sheet\b", re.IGNORECASE), "balance sheet"),
+    (re.compile(r"\bcashflow\b",         re.IGNORECASE), "cash flow"),
+    (re.compile(r"\bp\s*&\s*l\b",        re.IGNORECASE), "profit and loss"),
+    (re.compile(r"\brevenu\b",           re.IGNORECASE), "revenue"),
+    (re.compile(r"\bproj\b",             re.IGNORECASE), "project"),
+    (re.compile(r"\bquater\b|\bquatre\b", re.IGNORECASE), "quarter"),
+]
+
+
+# Scratchpad markers we strip from LLM output. Some models (notably gpt-oss)
+# occasionally leak chain-of-thought before producing the actual answer. The
+# answer typically starts with a heading or a "Framing"/"Headline"/"Answer"
+# token; everything before the LAST such marker is reasoning leakage.
+_SCRATCH_HEAD_RE = re.compile(
+    r"(?ims)^(?:.*?)(^(?:#{1,6}\s+\S|(?:framing|headline|summary|answer|result|"
+    r"comparison|overview|response|infosys\b|the\b)\b))",
+)
+_SCRATCH_PHRASES = (
+    "we should produce", "we need to", "let's craft", "let me",
+    "we will use", "we can compute", "actually,", "thus we answer",
+    "given the instruction",
+)
+
+
+def _strip_scratchpad(answer: str) -> str:
+    """Best-effort drop of pre-answer planning text.
+
+    Strategy: if the FIRST few lines contain known scratchpad phrases AND the
+    text later transitions into a heading or a recognised section opener,
+    return everything from that opener onward. Otherwise return the answer
+    unchanged. Conservative -- we never strip a clean answer."""
+    if not answer:
+        return answer
+    head = answer[:600].lower()
+    if not any(p in head for p in _SCRATCH_PHRASES):
+        return answer
+    # Find the first markdown heading line (### / ## / # ...) -- this is
+    # almost always where the real answer starts in our modes.
+    m = re.search(r"(?m)^#{1,6}\s+\S.*$", answer)
+    if m:
+        return answer[m.start():].lstrip()
+    # Failing a heading, find a recognised section opener at the start of a line.
+    m = re.search(
+        r"(?im)^(?:framing|headline|summary|answer|result|comparison|overview|"
+        r"response)\b.*$",
+        answer,
+    )
+    if m:
+        return answer[m.start():].lstrip()
+    return answer
+
+
+def _normalize_question_typos(text: str) -> str:
+    """Apply the cheap typo fixes above. Idempotent and safe on empty input."""
+    if not text:
+        return text
+    out = text
+    for pat, repl in _TYPO_FIXES:
+        out = pat.sub(repl, out)
+    return out
 
 
 def is_numeric_question(question):
@@ -690,6 +801,51 @@ def _prefer_inr(docs):
         c = _doc_currency(d)
         (inr if c == "inr" else usd if c == "usd" else unk).append(d)
     return inr + unk + usd
+
+
+# Currency intent. When the user explicitly asks for a particular reporting
+# unit ("in INR", "in rupees", "₹", "in dollars", "in USD", "$"), we hard-
+# filter the context to ONLY that currency's chunks so the LLM can't even
+# see the other unit. This is the cleanest fix for the recurring "rendered
+# $ figures with a ₹ label" bug -- the wrong-unit chunks aren't in scope.
+_INR_INTENT_RE = re.compile(
+    r"(\bin\s+(?:inr|rs\.?|rupees?|inrs)\b|\binr\b|\brupees?\b|₹|`\s*crore)",
+    re.IGNORECASE,
+)
+_USD_INTENT_RE = re.compile(
+    r"(\bin\s+(?:usd|us\s*\$|us\s*dollars?|dollars?)\b|\busd\b|us\s*\$|\$\s*million)",
+    re.IGNORECASE,
+)
+
+
+def detect_currency_intent(question):
+    """Return 'inr', 'usd', or None depending on the question's explicit
+    unit ask. INR wins on a tie because Indian filings default to ₹."""
+    if not question:
+        return None
+    has_inr = bool(_INR_INTENT_RE.search(question))
+    has_usd = bool(_USD_INTENT_RE.search(question))
+    if has_inr and not has_usd:
+        return "inr"
+    if has_usd and not has_inr:
+        return "usd"
+    if has_inr and has_usd:
+        return "inr"
+    return None
+
+
+def _filter_by_currency(docs, target):
+    """Keep only chunks classified as `target` ('inr' or 'usd'). Chunks of
+    unknown currency are kept either way -- they may be captions / narrative
+    pages whose unit is implied by context."""
+    if not target:
+        return docs
+    out = []
+    for d in docs:
+        c = _doc_currency(d)
+        if c == target or c is None:
+            out.append(d)
+    return out
 
 
 def _drop_redundant_usd(docs):
@@ -1063,11 +1219,17 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         all_periods = nlu.slots_to_periods(slots)
         nlu_metrics = list(slots.get("metrics") or [])
     else:
-        all_companies = detect_all_companies(question)
-        all_periods = detect_periods(question)
+        # Typo-tolerant pre-pass: light correction of the most common misspellings
+        # we've seen in user prompts. Only applied to the regex-fallback path so
+        # NLU (which is LLM-based) remains untouched -- the LLM handles typos.
+        question_norm = _normalize_question_typos(question)
+        all_companies = detect_all_companies(question_norm)
+        all_periods = detect_periods(question_norm)
         # Range expansion: "from FY24 to FY26" -> {FY24, FY25, FY26}; "Q3 FY23
         # to Q3 FY24" -> {Q3FY23..Q3FY24}.
-        all_periods = expand_period_range(all_periods, question)
+        all_periods = expand_period_range(all_periods, question_norm)
+        # Promote bare years inheriting the leading quarter ("Q1 2018 with 2019").
+        all_periods = _promote_bare_years(all_periods, question_norm)
         # Free-standing Q3 + annual range -> narrow each FYxx -> Q3FYxx.
         standalone_q = detect_standalone_quarter(question)
         if standalone_q and all_periods and all(p.startswith("FY") for p in all_periods):
@@ -1149,8 +1311,16 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         upload_docs = []
         if has_uploads:
             try:
+                # Pass the detected statement targets so the upload retriever
+                # can run anchor probes for "balance sheet", "cash flow", etc.
+                # Otherwise the ratio-analysis page tends to out-rank the
+                # actual balance-sheet page on pure cosine similarity.
+                upload_stmt_targets = {
+                    stmt for _, stmt in detect_statement_targets(question)
+                }
                 upload_docs = upload_store.retrieve_from_uploads(
                     rewritten, upload_ids,
+                    statement_targets=upload_stmt_targets,
                 )
             except Exception as e:
                 print(f"  [uploads] retrieve failed "
@@ -1168,7 +1338,19 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         # the attached PDF and the LLM answers from corpus content the user
         # didn't ask about. The remainder of the window is filled with
         # corpus hits so cross-document questions still work.
+        # Upload chunks: stable INR-first ordering, then HARD-filter by the
+        # currency the user explicitly asked for ("in INR" / "in USD"). The
+        # filter only fires when the user names a currency -- otherwise both
+        # variants remain in scope, INR-first.
         upload_dedup = _dedupe(upload_docs)
+        upload_dedup = _prefer_inr(upload_dedup)
+        currency_intent = detect_currency_intent(question)
+        if currency_intent:
+            upload_dedup = _filter_by_currency(upload_dedup, currency_intent)
+        # Same explicit-currency filter on the corpus side.
+        if currency_intent:
+            docs = _filter_by_currency(docs, currency_intent)
+
         if has_uploads and upload_dedup:
             reserve = max(
                 len(upload_dedup),
@@ -1212,6 +1394,12 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
             "history": _history_to_messages(history),
             "question": asked,
         })
+        # Strip chain-of-thought leakage. gpt-oss occasionally emits planning
+        # text before the final answer ("We should produce...", "Let's craft
+        # answer accordingly.Framing..."). Drop everything up to the first
+        # markdown heading or a "Framing"/"Headline"/"Answer" marker so the
+        # user sees only the final reply.
+        answer = _strip_scratchpad(answer)
     except Exception as e:
         # Most common failure mode is the LLM endpoint being unreachable
         # (Ollama cloud 502, local daemon not running, model not pulled).
