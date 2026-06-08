@@ -181,6 +181,7 @@ def _get_llm():
             base_url=config.OLLAMA_BASE_URL,
             temperature=0,
             format="json",
+            timeout=config.LLM_REQUEST_TIMEOUT_SEC,
         )
     return _LLM
 

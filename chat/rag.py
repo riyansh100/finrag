@@ -24,6 +24,7 @@ def get_llm():
             model=config.LLM_MODEL,
             base_url=config.OLLAMA_BASE_URL,
             temperature=0,
+            timeout=config.LLM_REQUEST_TIMEOUT_SEC,
         )
     return _llm
 

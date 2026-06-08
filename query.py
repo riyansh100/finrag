@@ -587,7 +587,8 @@ def is_figure_question(question):
 _STATEMENT_INTENTS = {
     "profit and loss": ["profit and loss", "profit & loss", "net profit",
                         "profit for the year", "income statement", "p&l", "revenue",
-                        "total income", "earnings"],
+                        "total income", "earnings", "comprehensive income",
+                        "statement of comprehensive income"],
     "balance sheet": ["balance sheet", "total assets", "total equity",
                       "liabilities", "net worth"],
     "cash flow": ["cash flow", "operating activities", "investing activities",
@@ -1135,7 +1136,8 @@ def rewrite_query(question, history, llm=None):
         return question
     if _is_self_contained(question):
         return question
-    llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0)
+    llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
+                            temperature=0, timeout=config.LLM_REQUEST_TIMEOUT_SEC)
     chain = REWRITE_PROMPT | llm | StrOutputParser()
     rewritten = chain.invoke({
         "history": _history_to_messages(history),
@@ -1176,7 +1178,8 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
     else:
         llm = ChatOllama(model=config.LLM_MODEL,
                          base_url=config.OLLAMA_BASE_URL,
-                         temperature=mode_cfg["temperature"])
+                         temperature=mode_cfg["temperature"],
+                         timeout=config.LLM_REQUEST_TIMEOUT_SEC)
 
     # Mode-specific prompt template. History placeholder + human turn match the
     # original PROMPT layout exactly.

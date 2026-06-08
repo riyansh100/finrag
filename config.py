@@ -5,6 +5,12 @@ DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
 LLM_MODEL = "gpt-oss:20b-cloud"
+# Hard ceiling on a single LLM call. Cloud Ollama occasionally accepts a
+# request and then stops streaming -- without this, the chat UI just blinks
+# forever. Anything over this triggers the friendly "model unreachable"
+# branch in query.ask(). 120s is comfortably above a normal 30-60s answer
+# but well short of "user gives up and reloads the tab".
+LLM_REQUEST_TIMEOUT_SEC = 120
 EMBEDDING_MODEL = "nomic-embed-text"
 VISION_MODEL = "granite3.2-vision:2b"   # ~2GB, document-focused; alternatives: "llama3.2-vision", "moondream"
 VISION_DPI = 96                       # render resolution for vision-model calls
