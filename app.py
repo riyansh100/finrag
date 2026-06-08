@@ -11,12 +11,10 @@ st.title("FinRAG")
 st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K} · "
            f"memory: last {config.HISTORY_TURNS // 2} Q&A pairs")
 
-
 @st.cache_resource(show_spinner="Loading LLM...")
 def load_llm():
     return ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
                       temperature=0)
-
 
 llm = load_llm()
 
