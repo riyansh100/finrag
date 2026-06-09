@@ -53,6 +53,18 @@ MMR_FETCH_K = 24
 MMR_LAMBDA = 0.7
 MAX_CONTEXT_CHUNKS = 24      # hard cap on chunks sent to the LLM per query
 
+# Cross-encoder reranker. Stage 1 (hybrid BM25 + vector) pulls a wide candidate
+# set; stage 2 scores each (question, chunk) jointly with a cross-encoder and
+# keeps the best ones. Cross-encoders read the question and chunk together, so
+# they handle nuance ("in USD" vs "(in US $ millions)" caption match) that
+# bi-encoder cosine misses. Set RERANKER_ENABLED=False to bypass the model
+# entirely (e.g. on a fresh box before it's downloaded).
+RERANKER_ENABLED = True
+RERANKER_MODEL = "BAAI/bge-reranker-base"   # ~280MB, multilingual, strong on tables
+RERANKER_FETCH_K = 50        # candidates passed to the reranker per retrieve()
+# After reranking we still respect MAX_CONTEXT_CHUNKS; this just controls how
+# many candidates the cross-encoder sees.
+
 # Analytics layer (Slice 2) -- MetricFact cache + Redis L1.
 # Redis is OPTIONAL. If unreachable the cache transparently falls back to
 # SQLite (chat.MetricFact). Set REDIS_URL="" to disable Redis entirely.

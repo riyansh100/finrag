@@ -23,6 +23,7 @@ from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
 import nlu
 import cache as fact_cache
+import reranker
 import recall as analysis_recall
 import uploads as upload_store
 
@@ -997,7 +998,16 @@ def retrieve(question, source_filter=None, multi_sources=None,
         # from misreading US$ millions as ₹ crore.
         ordered = _dedupe(anchor_docs) + _prefer_inr(_dedupe(docs))
         ordered = _drop_redundant_usd(_dedupe(ordered))
-        return ordered[:config.MAX_CONTEXT_CHUNKS], numeric
+        # Stage 2: cross-encoder rerank. Anchors stay pinned at the front
+        # (they were chosen to guarantee statement coverage and shouldn't be
+        # demoted by raw question-similarity); the rest of the candidates
+        # get rescored against the question and the top slots fill the
+        # remaining context budget.
+        anchors_keep = _dedupe(anchor_docs)
+        rest = [d for d in ordered if d not in anchors_keep]
+        budget = max(0, config.MAX_CONTEXT_CHUNKS - len(anchors_keep))
+        rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
+        return (anchors_keep + rest)[:config.MAX_CONTEXT_CHUNKS], numeric
 
     if multi_sources and not source_filter:
         # Multi-author comparison: per-source pull only, equal seats each.
@@ -1083,7 +1093,17 @@ def retrieve(question, source_filter=None, multi_sources=None,
     base = _hybrid_retrieve(question, k=top_k, **flt)
 
     docs = _prefer_inr(_dedupe(statement_bonus + board_bonus + type_bonus + base))
-    docs = _drop_redundant_usd(docs)[:config.MAX_CONTEXT_CHUNKS]
+    docs = _drop_redundant_usd(docs)
+    # Stage 2: cross-encoder rerank on the remainder. statement_bonus and
+    # board_bonus are pinned (they're the whole-page promotions we
+    # deliberately want in context); only the type_bonus + base candidates
+    # get rescored.
+    pinned = _dedupe(statement_bonus + board_bonus)
+    pinned = [d for d in docs if d in pinned]      # keep them in current order
+    rest = [d for d in docs if d not in pinned]
+    budget = max(0, config.MAX_CONTEXT_CHUNKS - len(pinned))
+    rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
+    docs = (pinned + rest)[:config.MAX_CONTEXT_CHUNKS]
     return docs, numeric
 
 

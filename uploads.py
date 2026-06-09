@@ -28,6 +28,7 @@ from langchain_core.documents import Document as _Doc
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
+import reranker
 from embeddings import make_embeddings
 from ingest import load_pdf
 from parsers import detect_upload_meta
@@ -341,4 +342,13 @@ def retrieve_from_uploads(question: str, upload_ids, k: int = None,
             print(f"  [upload {uid}] retrieve failed: "
                   f"{type(e).__name__}: {str(e)[:120]}")
             continue
+    # Stage 2: cross-encoder rerank across the merged upload candidates.
+    # We cap to RERANKER_FETCH_K first (so a chatty upload doesn't blow
+    # up the cross-encoder), then keep the top UPLOAD_TOP_K per the
+    # caller's k argument. Fail-open inside reranker.rerank().
+    if out:
+        rerank_top = (k or config.UPLOAD_TOP_K) * max(1, len(upload_ids))
+        out = reranker.rerank(question,
+                              out[:config.RERANKER_FETCH_K],
+                              top_k=rerank_top)
     return out
