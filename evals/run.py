@@ -25,7 +25,15 @@ import yaml
 # Make parent dir importable when running as `python evals/run.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from query import ask, detect_source_filter, is_numeric_question, retrieve  # noqa: E402
+# Initialise Django so the fact-cache and recall layers (which hit the ORM) run
+# during evals instead of silently no-op'ing with AppRegistryNotReady. Mirrors
+# what the server does, so cache short-circuit behaviour is exercised too.
+import os  # noqa: E402
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "finrag_backend.settings")
+import django  # noqa: E402
+django.setup()
+
+from query import ask  # noqa: E402
 
 
 GREEN = "\033[32m"
@@ -81,19 +89,17 @@ def run_case(idx, case, retrieval_only=False):
     print(f"\n[{idx}] {YELLOW}{q}{RESET}")
 
     t0 = time.time()
-    detected_filter = detect_source_filter(q)
-    numeric = is_numeric_question(q)
-
-    if retrieval_only:
-        docs, _ = retrieve(q, source_filter=detected_filter)
-        answer = None
-    else:
-        result = ask(q)
-        docs = result["sources"]
-        answer = result["answer"]
-        # ask() recomputes filter+numeric; use its values for consistency
-        detected_filter = result["filtered_to"]
-        numeric = result["numeric"]
+    # ask() does the full slot/atom resolution; we always call it so the
+    # company/period/atom checks are scored the same way in both modes. Under
+    # --retrieval we just skip reading the (LLM-generated) answer.
+    result = ask(q, skip_generation=retrieval_only)
+    docs = result["sources"]
+    answer = None if retrieval_only else result["answer"]
+    detected_filter = result["filtered_to"]
+    numeric = result["numeric"]
+    company = result.get("company_filter")
+    period = result.get("period_filter")
+    atoms_fired = bool(result.get("atoms"))
     elapsed = time.time() - t0
 
     checks = []
@@ -106,6 +112,25 @@ def run_case(idx, case, retrieval_only=False):
     ok = detected_filter == exp_filter
     checks.append(("filter", ok))
     print(_fmt(ok, "filter", f"got={detected_filter!r} exp={exp_filter!r}"))
+
+    if "expect_company" in case:
+        exp = case["expect_company"]
+        ok = company == exp
+        checks.append(("company", ok))
+        print(_fmt(ok, "company", f"got={company!r} exp={exp!r}"))
+
+    if "expect_period" in case:
+        exp = case["expect_period"]
+        ok = period == exp
+        checks.append(("period", ok))
+        print(_fmt(ok, "period", f"got={period!r} exp={exp!r}"))
+
+    if "expect_atoms" in case:
+        exp = bool(case["expect_atoms"])
+        ok = atoms_fired == exp
+        checks.append(("atoms", ok))
+        n = len(result.get("atoms") or [])
+        print(_fmt(ok, "atoms", f"got={atoms_fired}({n}) exp={exp}"))
 
     exp_numeric = case.get("expect_numeric")
     if exp_numeric is not None:

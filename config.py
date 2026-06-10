@@ -4,7 +4,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
-LLM_MODEL = "gpt-oss:20b-cloud"
+LLM_MODEL = "minimax-m3:cloud"
 # Hard ceiling on a single LLM call. Cloud Ollama occasionally accepts a
 # request and then stops streaming -- without this, the chat UI just blinks
 # forever. Anything over this triggers the friendly "model unreachable"

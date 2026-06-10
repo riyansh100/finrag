@@ -1,90 +1,230 @@
-# FinRAG evaluation set.
+# FinRAG evaluation set — infosys + riil financial corpus.
 #
-# Each item:
+# Corpus (chunk `source` filenames):
+#   infosys  q{1,2,3}-{2021..2026}.pdf   (quarterly; q1-2024.pdf -> Q1FY24)
+#   riil     Annual-Report-2024-25.pdf   (annual; FY25)
+#
+# Numeric substrings below are anchored on validated MetricFact rows. Where a
+# value is >= 1 lakh, we assert a comma-group TAIL (e.g. "31,322" for 131322)
+# so the check passes under BOTH Indian ("1,31,322") and Western ("131,322")
+# digit grouping. Values < 1 lakh format identically in both, so the full
+# number is asserted.
+#
+# Each case:
 #   question:           the user question
 #   expect_source:      filename (or list) that MUST appear in retrieved chunks
-#   expect_filter:      filename the source-filter should resolve to (null = no filter)
-#   expect_substrings:  list of strings that MUST all appear in the answer (case-insensitive)
+#   expect_filter:      author/source-filter resolution (null for financial corpus)
+#   expect_company:     resolved single company_filter (null if 0 or >=2 companies)
+#   expect_period:      resolved single period_filter (null if 0 or >=2 periods)
+#   expect_atoms:       True if the per-atom fan-out should fire (>=2 cells)
 #   expect_numeric:     True if numeric-intent detection should fire
-#   forbid_substrings:  list of strings that must NOT appear (optional)
+#   expect_substrings:  strings that MUST all appear in the answer (case-insensitive)
+#   forbid_substrings:  strings that must NOT appear (optional)
 #   notes:              freeform; not scored
+#
+# Fast checks (retrieval/filter/company/period/atoms/numeric) run under
+# `--retrieval` with no LLM. answer-substring checks need a full run.
 
 cases:
-  # --- Author filter + single-doc lookup ---
-  - question: "what is vikhyat's project about"
-    expect_source: B167_Vikhyat_Agrawal_FPR.pdf
-    expect_filter: B167_Vikhyat_Agrawal_FPR.pdf
-    expect_substrings: ["landslide"]
-    expect_numeric: false
-
-  - question: "summarize riyansh's project"
-    expect_source: B076_RiyanshSachdev_FPR.pdf
-    expect_filter: B076_RiyanshSachdev_FPR.pdf
-    expect_substrings: ["finseal"]
-    expect_numeric: false
-
-  - question: "what tech stack did prakarsh use"
-    expect_source: B077_PrakarshGarg_FinalReport.pdf
-    expect_filter: B077_PrakarshGarg_FinalReport.pdf
-    expect_substrings: ["react", "flask"]
-    expect_numeric: false
-
-  - question: "what problem is sarah solving"
-    expect_source: B012_SarahSyed_FPR.pdf
-    expect_filter: B012_SarahSyed_FPR.pdf
-    expect_substrings: ["ex-gratia"]
-    expect_numeric: false
-
-  # --- OCR'd content (Jash) ---
-  - question: "what does prodigal softtech do"
-    expect_source: B016_JashUpadhyay_FPR.pdf
+  # ---------------------------------------------------------------------------
+  # 1. Single-cell numeric lookups (no fan-out; period_filter set)
+  # ---------------------------------------------------------------------------
+  - question: "what were infosys total assets in Q1 FY24"
+    expect_source: q1-2024.pdf
     expect_filter: null
-    expect_substrings: ["prodigal"]
-    expect_numeric: false
-    notes: "Tests OCR path + BM25 entity match — no author name in question, so no filter expected."
-
-  # --- Numeric / table retrieval on financial docs ---
-  - question: "what are the total assets of apex financial services"
-    expect_source: synthetic_balance_sheet_2.pdf
-    expect_filter: null
-    expect_substrings: ["825,000"]
+    expect_company: infosys
+    expect_period: Q1FY24
+    expect_atoms: false
     expect_numeric: true
+    expect_substrings: ["31,322"]            # 131322
+    forbid_substrings: ["cannot provide", "private compan"]
 
-  - question: "what was the amount for inventory only for apex financial services"
-    expect_source: synthetic_balance_sheet_2.pdf
+  - question: "infosys total equity for Q1 FY24"
+    expect_source: q1-2024.pdf
     expect_filter: null
-    expect_substrings: ["95,000"]
+    expect_company: infosys
+    expect_period: Q1FY24
+    expect_atoms: false
     expect_numeric: true
-    forbid_substrings: ["cannot provide", "private companies"]
-    notes: "Regression: model previously refused on this phrasing."
+    expect_substrings: ["74,828"]
 
-  - question: "what is the owner equity for greencore industries"
-    expect_source: synthetic_balance_sheet_3.pdf
+  - question: "what was infosys revenue in Q1 FY25"
+    expect_source: q1-2025.pdf
     expect_filter: null
-    expect_substrings: ["600,000"]
+    expect_company: infosys
+    expect_period: Q1FY25
+    expect_atoms: false
     expect_numeric: true
+    expect_substrings: ["39,315"]
 
-  - question: "what is the cash and investments amount for nova tech solutions"
-    expect_source: synthetic_balance_sheet_1.pdf
+  - question: "infosys profit after tax for Q1 FY25"
+    expect_source: q1-2025.pdf
     expect_filter: null
-    expect_substrings: ["120,000"]
+    expect_company: infosys
+    expect_period: Q1FY25
+    expect_atoms: false
     expect_numeric: true
+    expect_substrings: ["6,368"]
 
-  # --- Cross-doc ---
-  - question: "compare total assets across the three balance sheets"
+  - question: "give me the balance sheet for infosys Q1 FY24"
+    expect_source: q1-2024.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY24
+    expect_atoms: false
+    expect_numeric: true
+    expect_substrings: ["31,322", "56,494"]  # total assets + total liabilities
+    notes: "Statement-targeted retrieval; whole balance-sheet page should land."
+
+  - question: "infosys trade receivables Q1 FY23"
+    expect_source: q1-2023.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY23
+    expect_atoms: false
+    expect_numeric: true
+    expect_substrings: ["23,038"]
+
+  - question: "what is infosys PAT margin for Q1 FY25"
+    expect_source: q1-2025.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY25
+    expect_atoms: false
+    expect_numeric: true
+    expect_substrings: ["16.2"]
+
+  # ---------------------------------------------------------------------------
+  # 2. Single company, no period (company_filter set, no fan-out)
+  # ---------------------------------------------------------------------------
+  - question: "summarize infosys' latest quarterly results"
+    expect_source: null            # don't pin a specific quarter
+    expect_filter: null
+    expect_company: infosys
+    # "latest" fuzzily resolves to a period (Q4FY26) — don't assert it.
+    expect_atoms: false
+    expect_numeric: false          # "summarize results" has no numeric keyword
+    expect_substrings: ["infosys"]
+
+  # ---------------------------------------------------------------------------
+  # 3. Per-atom fan-out: ONE company x MULTIPLE periods
+  #    (exercises nlu.build_atoms + the per-atom retrieval branch)
+  # ---------------------------------------------------------------------------
+  - question: "compare infosys revenue in Q1 FY23 and Q1 FY25"
     expect_source:
-      - synthetic_balance_sheet_1.pdf
-      - synthetic_balance_sheet_2.pdf
-      - synthetic_balance_sheet_3.pdf
+      - q1-2023.pdf
+      - q1-2025.pdf
     expect_filter: null
-    expect_substrings: ["515,000", "825,000", "915,000"]
+    expect_company: infosys        # single company -> still a company_filter
+    expect_period: null            # 2 periods -> no single period_filter
+    expect_atoms: true
     expect_numeric: true
+    expect_substrings: ["34,470", "39,315"]
+    notes: "Atom path: infosys x {Q1FY23, Q1FY25}. Neither period should crowd out the other."
 
-  # --- Negative / grounding test ---
+  - question: "compare infosys total assets across Q1 FY24 and Q1 FY25"
+    expect_source:
+      - q1-2024.pdf
+      - q1-2025.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: null
+    expect_atoms: true
+    expect_numeric: true
+    expect_substrings: ["31,322", "44,019"]   # 131322 and 144019
+    notes: "Atom path; both totals must appear."
+
+  # ---------------------------------------------------------------------------
+  # 4. Per-atom fan-out: MULTIPLE companies (the bug atoms fixed —
+  #    previously company_filter was None so nothing got scoped)
+  # ---------------------------------------------------------------------------
+  - question: "compare total assets of infosys and reliance"
+    # No period named, so we can't pin a specific infosys quarter. Assert the
+    # RIIL annual report appears — it's the cell that previously got crowded
+    # out before atoms gave each company its own scoped pass.
+    expect_source: Annual-Report-2024-25.pdf
+    expect_filter: null
+    expect_company: null           # 2 companies -> no single company_filter
+    expect_period: null
+    expect_atoms: true
+    expect_numeric: true
+    expect_substrings: ["infosys", "reliance"]
+    notes: "Multi-company atom path. Both companies must get seats in context."
+
+  # ---------------------------------------------------------------------------
+  # 5. RIIL annual report (retrieval-grounded; no MetricFact yet)
+  # ---------------------------------------------------------------------------
+  - question: "what does reliance industrial infrastructure do"
+    expect_source: Annual-Report-2024-25.pdf
+    expect_filter: null
+    expect_company: riil
+    expect_period: null
+    expect_atoms: false
+    expect_numeric: false
+    expect_substrings: ["reliance"]
+
+  - question: "who are the directors on the reliance industrial infrastructure board"
+    expect_source: Annual-Report-2024-25.pdf
+    expect_filter: null
+    expect_company: riil
+    expect_period: null
+    expect_atoms: false
+    expect_numeric: false
+    expect_substrings: ["director"]
+    notes: "Board-listing retrieval path."
+
+  # ---------------------------------------------------------------------------
+  # 6. Currency intent (INR vs USD scoping)
+  # ---------------------------------------------------------------------------
+  - question: "infosys revenue Q1 FY25 in INR"
+    expect_source: q1-2025.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY25
+    expect_atoms: false
+    expect_numeric: true
+    expect_substrings: ["39,315"]
+    forbid_substrings: ["US$", "USD millions"]
+    notes: "Explicit INR -> USD duplicate chunks should be filtered out."
+
+  # ---------------------------------------------------------------------------
+  # 7. Trend over many periods (pure multi-period, company-scoped — atoms
+  #    fire because 1 company x N periods)
+  # ---------------------------------------------------------------------------
+  - question: "show infosys total assets trend from Q1 FY23 to Q1 FY25"
+    expect_source:
+      - q1-2023.pdf
+      - q1-2024.pdf
+      - q1-2025.pdf
+    expect_filter: null
+    expect_company: infosys
+    expect_period: null
+    expect_atoms: true
+    expect_numeric: true
+    expect_substrings: ["31,322", "44,019"]
+    notes: "Range expansion -> Q1FY23..Q1FY25; every period gets a slice."
+
+  # ---------------------------------------------------------------------------
+  # 8. Negative / grounding — must refuse, not fabricate
+  # ---------------------------------------------------------------------------
   - question: "what is the weather in mumbai today"
     expect_source: null
     expect_filter: null
+    expect_company: null
+    expect_period: null
+    expect_atoms: false
+    expect_numeric: false
     expect_substrings: []
     forbid_substrings: ["sunny", "rain", "celsius", "fahrenheit", "degrees"]
-    expect_numeric: false
     notes: "Off-topic. Model must refuse rather than fabricate weather data."
+
+  - question: "what was infosys revenue in Q4 FY27"
+    expect_source: null
+    expect_filter: null
+    expect_company: infosys
+    expect_period: null            # Q4FY27 not in corpus -> validation drops it
+    expect_atoms: false
+    expect_numeric: true
+    expect_substrings: []
+    forbid_substrings: ["42,000", "45,000"]
+    notes: "Period outside corpus. Must not invent a figure for a non-existent quarter."

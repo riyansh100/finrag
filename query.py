@@ -892,9 +892,56 @@ def _period_label_to_filter_kwargs(label):
     return {"period_filter": label}
 
 
+def _anchor_probe_for(question):
+    """Pick the anchor probe, its must-have signature rows, and the statement
+    targets for a numeric fan-out, based on which financial statement the
+    question implies. Shared by the per-period and per-atom fan-out branches so
+    the two can't drift apart. Default = income statement (most common case)."""
+    targets = detect_statement_targets(question)
+    target_stmts = {stmt for _, stmt in targets}
+    if "balance sheet" in target_stmts:
+        probe = ("Total assets Total equity Total liabilities "
+                 "Cash and cash equivalents Trade receivables "
+                 "Property plant and equipment in rupees crore")
+        must_have = ("Total assets", "Total equity")
+    elif "cash flow" in target_stmts:
+        probe = ("Cash flow from operating activities investing "
+                 "financing activities net increase decrease in cash")
+        must_have = ("operating activities", "investing activities")
+    else:
+        probe = ("Revenues Cost of Sales Gross profit Operating profit "
+                 "Net profit Basic EPS in rupees crore")
+        must_have = ("Revenues", "Operating profit")
+    return probe, must_have, targets
+
+
+def _finalize_fanout(question, anchor_docs, docs):
+    """Shared merge + pin + rerank tail for the fan-out branches.
+
+    Anchors stay pinned at the front (they were chosen to guarantee statement
+    coverage and shouldn't be demoted by raw question-similarity); the rest of
+    the candidates get rescored against the question and the top slots fill the
+    remaining context budget. Pin by content key, not Python identity -- the
+    anchor and base passes build separate Document instances for the same chunk,
+    so identity matching silently produces an empty pin set."""
+    ordered = _dedupe(anchor_docs) + _prefer_inr(_dedupe(docs))
+    ordered = _drop_redundant_usd(_dedupe(ordered))
+
+    def _pin_key(d):
+        return (d.metadata.get("source"), d.metadata.get("page"),
+                d.metadata.get("type"), (d.page_content or "")[:80])
+
+    anchor_keys = {_pin_key(d) for d in _dedupe(anchor_docs)}
+    anchors_keep = [d for d in ordered if _pin_key(d) in anchor_keys]
+    rest = [d for d in ordered if _pin_key(d) not in anchor_keys]
+    budget = max(0, config.MAX_CONTEXT_CHUNKS - len(anchors_keep))
+    rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
+    return (anchors_keep + rest)[:config.MAX_CONTEXT_CHUNKS]
+
+
 def retrieve(question, source_filter=None, multi_sources=None,
              company_filter=None, period_filter=None, periods=None,
-             top_k=None):
+             atoms=None, top_k=None):
     """Hybrid (BM25 + vector) retrieval with type / multi-source biasing.
 
     multi_sources: iterable of filenames. When set, retrieval is RESTRICTED to
@@ -906,6 +953,12 @@ def retrieve(question, source_filter=None, multi_sources=None,
     periods: iterable of period labels for range/trend questions ("Q1FY25
         through Q3FY26"). When set, retrieval fans out one pass per period and
         merges, so every period in the range gets seats in the context.
+    atoms: iterable of {"company", "period"} cells (from nlu.build_atoms).
+        When set (>=2 cells), retrieval fans out one pass per atom with BOTH a
+        company and a period hard-filter pinned, then merges. This is the
+        primary fan-out for multi-company and company×period questions, where a
+        single unscoped pass lets one cell crowd the others out. Takes priority
+        over `periods`.
     top_k: optional override for config.TOP_K — modes like analyze/compare use
         this to pull a larger base context.
     """
@@ -913,8 +966,51 @@ def retrieve(question, source_filter=None, multi_sources=None,
     numeric = is_numeric_question(question)
     figure = is_figure_question(question)
 
-    # Multi-period fan-out comes FIRST: ranges/trends span periods, so we want
-    # an equal slice per period rather than letting hybrid pick the most
+    # Per-atom fan-out comes FIRST: it's the only path that scopes BOTH company
+    # and period per pass, so multi-company and company×period questions get an
+    # equal, hard-filtered slice per cell instead of letting the most
+    # textually-similar cell dominate. Falls through to the period/single paths
+    # when there are no atoms (pure multi-period, single cell).
+    if atoms and len(atoms) >= 2 and not period_filter:
+        docs = []
+        anchor_docs = []
+        k_per = max(3, top_k // len(atoms) + 2)
+        anchor_probe, anchor_must_have, targets = _anchor_probe_for(question)
+        for atom in atoms:
+            a_company = atom.get("company") or company_filter
+            flt = {"source_filter": source_filter, "company_filter": a_company}
+            if atom.get("period"):
+                flt.update(_period_label_to_filter_kwargs(atom["period"]))
+            docs += _hybrid_retrieve(question, k=k_per, **flt)
+            if numeric:
+                docs += _hybrid_retrieve(question, k=max(2, k_per // 2),
+                                         type_filter="table", **flt)
+                # One guaranteed anchor slot per cell: prefer INR, take the
+                # first chunk carrying the target statement's signature rows.
+                anchor_type_filter = None if targets else "table"
+                cand = _hybrid_retrieve(anchor_probe, k=8,
+                                        type_filter=anchor_type_filter, **flt)
+                cand = _prefer_inr(cand)
+                picked = next((d for d in cand
+                               if all(kw in d.page_content for kw in anchor_must_have)),
+                              None)
+                if picked is None and cand:
+                    picked = cand[0]
+                if picked is not None:
+                    anchor_docs.append(picked)
+                    # Statement target named -> pull the anchor's whole page;
+                    # table extraction often splits the statement across chunks.
+                    if targets:
+                        src = picked.metadata.get("source")
+                        pg = picked.metadata.get("page")
+                        if src and pg:
+                            anchor_docs += [d for d in _all_docs()
+                                            if d.metadata.get("source") == src
+                                            and d.metadata.get("page") == pg]
+        return _finalize_fanout(question, anchor_docs, docs), numeric
+
+    # Multi-period fan-out: ranges/trends span periods, so we want an equal
+    # slice per period rather than letting hybrid pick the most
     # textually-similar one (which tends to mean a single period dominates).
     if periods and len(periods) >= 2 and not period_filter:
         docs = []
@@ -923,27 +1019,7 @@ def retrieve(question, source_filter=None, multi_sources=None,
         # Per-period anchor probe. We pick the BEST anchor chunk per period
         # and promote it to the front of the context so MAX_CONTEXT_CHUNKS
         # can't drop the actual figures page when fan-out is heavy.
-        # Probe and the "this chunk is the right table" gate depend on which
-        # financial statement the user is asking about. Default = income
-        # statement (the most common case); switches when detect_statement_targets
-        # names balance sheet / cash flow.
-        targets = detect_statement_targets(question)
-        target_stmts = {stmt for _, stmt in targets}
-        if "balance sheet" in target_stmts:
-            anchor_probe = ("Total assets Total equity Total liabilities "
-                            "Cash and cash equivalents Trade receivables "
-                            "Property plant and equipment in rupees crore")
-            anchor_must_have = ("Total assets", "Total equity")
-        elif "cash flow" in target_stmts:
-            anchor_probe = ("Cash flow from operating activities investing "
-                            "financing activities net increase decrease in cash")
-            anchor_must_have = ("operating activities", "investing activities")
-        else:
-            anchor_probe = (
-                "Revenues Cost of Sales Gross profit Operating profit "
-                "Net profit Basic EPS in rupees crore"
-            )
-            anchor_must_have = ("Revenues", "Operating profit")
+        anchor_probe, anchor_must_have, targets = _anchor_probe_for(question)
         for p in periods:
             p_kwargs = _period_label_to_filter_kwargs(p)
             docs += _hybrid_retrieve(question, k=k_per,
@@ -992,27 +1068,7 @@ def retrieve(question, source_filter=None, multi_sources=None,
                         anchor_docs += [d for d in _all_docs()
                                         if d.metadata.get("source") == src
                                         and d.metadata.get("page") == pg]
-        # Anchors first so they survive the MAX_CONTEXT_CHUNKS cap, then the
-        # rest of the fan-out hits in INR-preferred order. Drop redundant USD
-        # duplicates of any source that also has an INR chunk — keeps the LLM
-        # from misreading US$ millions as ₹ crore.
-        ordered = _dedupe(anchor_docs) + _prefer_inr(_dedupe(docs))
-        ordered = _drop_redundant_usd(_dedupe(ordered))
-        # Stage 2: cross-encoder rerank. Anchors stay pinned at the front
-        # (they were chosen to guarantee statement coverage and shouldn't be
-        # demoted by raw question-similarity); the rest of the candidates
-        # get rescored against the question and the top slots fill the
-        # remaining context budget. Pin by content key, not identity --
-        # see single-target path for the rationale.
-        def _pin_key(d):
-            return (d.metadata.get("source"), d.metadata.get("page"),
-                    d.metadata.get("type"), (d.page_content or "")[:80])
-        anchor_keys = {_pin_key(d) for d in _dedupe(anchor_docs)}
-        anchors_keep = [d for d in ordered if _pin_key(d) in anchor_keys]
-        rest = [d for d in ordered if _pin_key(d) not in anchor_keys]
-        budget = max(0, config.MAX_CONTEXT_CHUNKS - len(anchors_keep))
-        rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
-        return (anchors_keep + rest)[:config.MAX_CONTEXT_CHUNKS], numeric
+        return _finalize_fanout(question, anchor_docs, docs), numeric
 
     if multi_sources and not source_filter:
         # Multi-author comparison: per-source pull only, equal seats each.
@@ -1179,7 +1235,65 @@ def rewrite_query(question, history, llm=None):
     return rewritten or question
 
 
-def ask(question, history=None, llm=None, mode=None, upload_ids=None):
+def _generate_answer(chain, context, history_messages, asked):
+    """Invoke the answer chain and return a clean, non-empty answer string.
+
+    Wraps the LLM call so the only failure modes the caller sees are friendly
+    text (empty-response notice, unreachable-endpoint notice) rather than
+    exceptions. Retrieval has already run, so on any error we still return a
+    string the UI can render alongside the Sources panel."""
+    try:
+        raw_answer = chain.invoke({
+            "context": context,
+            "history": history_messages,
+            "question": asked,
+        })
+        # Strip chain-of-thought leakage. Reasoning models occasionally emit
+        # planning text before the final answer ("We should produce...",
+        # "Let's craft answer accordingly."). Drop everything up to the first
+        # markdown heading or a "Framing"/"Headline"/"Answer" marker so the
+        # user sees only the final reply.
+        answer = _strip_scratchpad(raw_answer)
+        # Safety net: if scratchpad-stripping over-reaches and leaves nothing,
+        # fall back to the raw answer. If the model itself returned nothing,
+        # surface a clear "empty response" message so the UI never shows a
+        # silent blank bubble.
+        if not (answer or "").strip():
+            print(f"  [llm] strip emptied answer; raw length="
+                  f"{len(raw_answer or '')}; falling back to raw")
+            answer = raw_answer
+        if not (answer or "").strip():
+            print(f"  [llm] model returned empty response")
+            answer = (
+                "⚠️ The model returned an empty response. The retrieval ran "
+                "(see Sources below) but the LLM produced no text. Try the "
+                "same question again, or rephrase it slightly."
+            )
+        return answer
+    except Exception as e:
+        # Most common failure mode is the LLM endpoint being unreachable
+        # (Ollama cloud 502, local daemon not running, model not pulled).
+        # Surface a clean message instead of letting Django render a 500 page
+        # the user can't act on.
+        err_name = type(e).__name__
+        err_text = str(e)[:300]
+        print(f"  [llm] call failed: {err_name}: {err_text}")
+        if "unreachable" in err_text or "502" in err_text or "Connection" in err_text:
+            return (
+                f"⚠️ The language model is unreachable right now.\n\n"
+                f"Model: `{config.LLM_MODEL}`. If this name ends in "
+                f"`-cloud`, the request was routed through Ollama's hosted "
+                f"endpoint (ollama.com) and the connection failed. "
+                f"Check your network, or switch `LLM_MODEL` in `config.py` "
+                f"to a locally-pulled model (e.g. `llama3.1:8b`) and "
+                f"restart the server.\n\n"
+                f"Raw error: `{err_name}: {err_text}`"
+            )
+        return f"⚠️ The language model call failed: `{err_name}: {err_text}`."
+
+
+def ask(question, history=None, llm=None, mode=None, upload_ids=None,
+        skip_generation=False):
     """Run one RAG turn.
 
     Args:
@@ -1277,6 +1391,10 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
     company_filter = next(iter(all_companies)) if len(all_companies) == 1 else None
     period_filter = next(iter(all_periods)) if len(all_periods) == 1 else None
     periods_for_fanout = all_periods if len(all_periods) >= 2 else None
+    # Atomize: decompose multi-company / company×period questions into
+    # (company, period) cells so each gets a hard-filtered retrieval pass.
+    # Returns [] for the cases the period/single-target paths already handle.
+    atoms = nlu.build_atoms(all_companies, all_periods)
 
     # ----- Slice-2 fact cache --------------------------------------------
     # Look up cached facts BEFORE retrieval. Two outcomes:
@@ -1339,6 +1457,7 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
                                  company_filter=company_filter,
                                  period_filter=period_filter,
                                  periods=periods_for_fanout,
+                                 atoms=atoms,
                                  top_k=mode_cfg["top_k"])
         # Per-chat uploaded PDFs: pull chunks from each upload's own Chroma
         # collection and fuse with the corpus hits. Uploads come FIRST so the
@@ -1423,59 +1542,15 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
                 f"{question}"
             )
 
-    chain = mode_prompt | llm | StrOutputParser()
-    try:
-        raw_answer = chain.invoke({
-            "context": context,
-            "history": _history_to_messages(history),
-            "question": asked,
-        })
-        # Strip chain-of-thought leakage. gpt-oss occasionally emits planning
-        # text before the final answer ("We should produce...", "Let's craft
-        # answer accordingly.Framing..."). Drop everything up to the first
-        # markdown heading or a "Framing"/"Headline"/"Answer" marker so the
-        # user sees only the final reply.
-        answer = _strip_scratchpad(raw_answer)
-        # Safety net: if scratchpad-stripping over-reaches and leaves nothing,
-        # fall back to the raw answer. If the model itself returned nothing,
-        # surface a clear "empty response" message so the UI never shows a
-        # silent blank bubble.
-        if not (answer or "").strip():
-            print(f"  [llm] strip emptied answer; raw length="
-                  f"{len(raw_answer or '')}; falling back to raw")
-            answer = raw_answer
-        if not (answer or "").strip():
-            print(f"  [llm] model returned empty response")
-            answer = (
-                "⚠️ The model returned an empty response. The retrieval ran "
-                "(see Sources below) but the LLM produced no text. Try the "
-                "same question again, or rephrase it slightly."
-            )
-    except Exception as e:
-        # Most common failure mode is the LLM endpoint being unreachable
-        # (Ollama cloud 502, local daemon not running, model not pulled).
-        # Surface a clean message instead of letting Django render a 500 page
-        # the user can't act on. Retrieval already ran, so we keep `docs` for
-        # the Sources panel -- the answer slot just carries the error.
-        err_name = type(e).__name__
-        err_text = str(e)[:300]
-        print(f"  [llm] call failed: {err_name}: {err_text}")
-        if "unreachable" in err_text or "502" in err_text or "Connection" in err_text:
-            answer = (
-                f"⚠️ The language model is unreachable right now.\n\n"
-                f"Model: `{config.LLM_MODEL}`. If this name ends in "
-                f"`-cloud`, the request was routed through Ollama's hosted "
-                f"endpoint (ollama.com) and the connection failed. "
-                f"Check your network, or switch `LLM_MODEL` in `config.py` "
-                f"to a locally-pulled model (e.g. `llama3.1:8b`) and "
-                f"restart the server.\n\n"
-                f"Raw error: `{err_name}: {err_text}`"
-            )
-        else:
-            answer = (
-                f"⚠️ The language model call failed: "
-                f"`{err_name}: {err_text}`."
-            )
+    # Eval fast path: resolve slots/atoms/retrieval but skip the (slow) answer
+    # LLM call. Lets `evals/run.py --retrieval` score routing without paying for
+    # generation on every case.
+    if skip_generation:
+        answer = None
+    else:
+        chain = mode_prompt | llm | StrOutputParser()
+        answer = _generate_answer(
+            chain, context, _history_to_messages(history), asked)
     # Unified slot dict for downstream consumers (fact extractor, analytics
     # layer). Mirrors what NLU produced when it succeeded, but is also
     # populated by the regex fallback path so callers don't need to care
@@ -1513,6 +1588,9 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         "rewritten_query": rewritten if rewritten != question else None,
         "company_filter": company_filter,
         "period_filter": period_filter,
+        # (company, period) cells the question fanned out on. Empty for
+        # single-cell / pure-trend questions. Exposed for evals + diagnostics.
+        "atoms": atoms,
         "periods": sorted(periods_for_fanout) if periods_for_fanout else None,
         "companies": sorted(all_companies) if len(all_companies) >= 2 else None,
         "mode": mode_name,

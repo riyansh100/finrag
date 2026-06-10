@@ -149,6 +149,36 @@ def _validate(slots):
     return slots
 
 
+def build_atoms(companies, periods):
+    """Decompose a question's resolved (companies, periods) into retrieval atoms.
+
+    An atom is the smallest unit we retrieve for: a single (company, period)
+    cell. "Compare revenue across Infosys/RIIL for Q3FY24 and Q3FY25" becomes
+    4 atoms, each retrieved with BOTH a company and a period hard-filter, then
+    merged. This eliminates the "one cell crowded the others out" failure that
+    happens when a multi-company or multi-cell question runs as a single
+    unscoped retrieval.
+
+    Returns a list of {"company": <slug|None>, "period": <label|None>} dicts,
+    or [] when there's nothing worth fanning out on:
+
+      companies + periods         -> full cross product (company-scoped cells)
+      >=2 companies, no periods    -> one atom per company
+      otherwise (pure multi-period, single cell, nothing) -> []  (the existing
+            period fan-out / single-target paths already handle these well).
+    """
+    companies = sorted(companies or [])
+    periods = sorted(periods or [])
+    atoms = []
+    if companies and periods:
+        for c in companies:
+            for p in periods:
+                atoms.append({"company": c, "period": p})
+    elif len(companies) >= 2:
+        atoms = [{"company": c, "period": None} for c in companies]
+    return atoms if len(atoms) >= 2 else []
+
+
 def slots_to_periods(slots):
     """Cross quarters × fys into canonical period labels the retriever filters on.
 
