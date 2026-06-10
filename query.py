@@ -1002,9 +1002,14 @@ def retrieve(question, source_filter=None, multi_sources=None,
         # (they were chosen to guarantee statement coverage and shouldn't be
         # demoted by raw question-similarity); the rest of the candidates
         # get rescored against the question and the top slots fill the
-        # remaining context budget.
-        anchors_keep = _dedupe(anchor_docs)
-        rest = [d for d in ordered if d not in anchors_keep]
+        # remaining context budget. Pin by content key, not identity --
+        # see single-target path for the rationale.
+        def _pin_key(d):
+            return (d.metadata.get("source"), d.metadata.get("page"),
+                    d.metadata.get("type"), (d.page_content or "")[:80])
+        anchor_keys = {_pin_key(d) for d in _dedupe(anchor_docs)}
+        anchors_keep = [d for d in ordered if _pin_key(d) in anchor_keys]
+        rest = [d for d in ordered if _pin_key(d) not in anchor_keys]
         budget = max(0, config.MAX_CONTEXT_CHUNKS - len(anchors_keep))
         rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
         return (anchors_keep + rest)[:config.MAX_CONTEXT_CHUNKS], numeric
@@ -1097,10 +1102,18 @@ def retrieve(question, source_filter=None, multi_sources=None,
     # Stage 2: cross-encoder rerank on the remainder. statement_bonus and
     # board_bonus are pinned (they're the whole-page promotions we
     # deliberately want in context); only the type_bonus + base candidates
-    # get rescored.
-    pinned = _dedupe(statement_bonus + board_bonus)
-    pinned = [d for d in docs if d in pinned]      # keep them in current order
-    rest = [d for d in docs if d not in pinned]
+    # get rescored. We match by (source, page, type, content prefix) instead
+    # of Python identity because statement_bonus and docs are built from
+    # separate _all_docs() / _hybrid_retrieve passes and carry different
+    # Document instances for the same chunk -- identity matching silently
+    # produced an empty pin set, letting the reranker demote the very
+    # anchor chunks we needed.
+    def _pin_key(d):
+        return (d.metadata.get("source"), d.metadata.get("page"),
+                d.metadata.get("type"), (d.page_content or "")[:80])
+    pin_keys = {_pin_key(d) for d in (statement_bonus + board_bonus)}
+    pinned = [d for d in docs if _pin_key(d) in pin_keys]
+    rest   = [d for d in docs if _pin_key(d) not in pin_keys]
     budget = max(0, config.MAX_CONTEXT_CHUNKS - len(pinned))
     rest = reranker.rerank(question, rest[:config.RERANKER_FETCH_K], top_k=budget)
     docs = (pinned + rest)[:config.MAX_CONTEXT_CHUNKS]
@@ -1412,7 +1425,7 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
 
     chain = mode_prompt | llm | StrOutputParser()
     try:
-        answer = chain.invoke({
+        raw_answer = chain.invoke({
             "context": context,
             "history": _history_to_messages(history),
             "question": asked,
@@ -1422,7 +1435,22 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None):
         # answer accordingly.Framing..."). Drop everything up to the first
         # markdown heading or a "Framing"/"Headline"/"Answer" marker so the
         # user sees only the final reply.
-        answer = _strip_scratchpad(answer)
+        answer = _strip_scratchpad(raw_answer)
+        # Safety net: if scratchpad-stripping over-reaches and leaves nothing,
+        # fall back to the raw answer. If the model itself returned nothing,
+        # surface a clear "empty response" message so the UI never shows a
+        # silent blank bubble.
+        if not (answer or "").strip():
+            print(f"  [llm] strip emptied answer; raw length="
+                  f"{len(raw_answer or '')}; falling back to raw")
+            answer = raw_answer
+        if not (answer or "").strip():
+            print(f"  [llm] model returned empty response")
+            answer = (
+                "⚠️ The model returned an empty response. The retrieval ran "
+                "(see Sources below) but the LLM produced no text. Try the "
+                "same question again, or rephrase it slightly."
+            )
     except Exception as e:
         # Most common failure mode is the LLM endpoint being unreachable
         # (Ollama cloud 502, local daemon not running, model not pulled).
