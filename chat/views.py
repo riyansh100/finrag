@@ -73,6 +73,20 @@ def analysis_note_detail(request, note_id):
 
 
 @api_view(["GET"])
+def dashboard_data(request):
+    """GET /api/dashboard?company=<slug>  ->  chart-ready financial series.
+
+    Pure SQL over MetricFact — no RAG, no LLM. Returns, per company, a sorted
+    period axis and one aligned value-series per metric, plus default chart
+    groupings and human labels. `company` is optional (omit for all)."""
+    import dashboard as dashboard_data_layer
+
+    company = (request.query_params.get("company") or "").strip().lower() or None
+    payload = dashboard_data_layer.company_series(company=company)
+    return Response(payload)
+
+
+@api_view(["GET"])
 def mode_list(request):
     """GET /api/modes -> [{id, label, description}, ...] plus the default.
     Frontend uses this to populate the mode dropdown."""
@@ -298,11 +312,26 @@ def message_create(request, chat_id):
         chat.title = question[:80]
     chat.save(update_fields=["title", "updated_at"])
 
+    # Prompt-driven chart: if the question asked to visualise a single company's
+    # metric over time, build a chart spec from MetricFact (SQL, no LLM) so the
+    # frontend can render it next to the prose answer. Fault-tolerant — a chart
+    # hiccup must never break the answer.
+    chart = None
+    try:
+        import dashboard as dashboard_layer
+        chart = dashboard_layer.chart_for_question(question,
+                                                   result.get("slots"))
+    except Exception as e:
+        print(f"  [chart] build failed ({type(e).__name__}: {str(e)[:120]})")
+
     return Response(
         {
             "user_message": MessageSerializer(user_msg).data,
             "assistant_message": MessageSerializer(assistant_msg).data,
             "rewritten_query": result["rewritten_query"],
+            # Prompt-driven chart spec (or null). Transient — not persisted on
+            # the Message; re-rendered only for this live turn.
+            "chart": chart,
             # Slice-3: prior analyses with overlapping scope. List of
             # {id, message_id, chat_id, mode, scope, score, created_at,
             #  preview, body_length}. Empty when nothing matched. Frontend

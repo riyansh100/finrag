@@ -65,6 +65,8 @@ const postMessage = (id, question, mode, uploadIds) =>
     }),
   });
 const getNote = (id) => api(`/notes/${id}`);
+const getDashboard = (company) =>
+  api(`/dashboard${company ? `?company=${encodeURIComponent(company)}` : ""}`);
 
 // Slice-4 uploads. Multipart POST goes through fetch directly (api() forces
 // JSON content-type which breaks multipart boundary detection).
@@ -409,6 +411,141 @@ function readyUploadIds() {
     .map((u) => u.id);
 }
 
+// --- dashboard (cross-document charts) ---------------------------------------
+// Pure read of /api/dashboard (SQL over MetricFact, no RAG). Renders one
+// Plotly chart per default grouping, per company. Series come pre-aligned to a
+// shared period axis with nulls for gaps, so we plot them directly.
+
+const CHART_COLORS = ["#2ecc71", "#38bdf8", "#f5a623", "#ff5c5c", "#a78bfa"];
+
+const PLOT_LAYOUT = {
+  paper_bgcolor: "transparent",
+  plot_bgcolor: "transparent",
+  font: { family: "'IBM Plex Mono', monospace", color: "#8a97a8", size: 11 },
+  margin: { l: 56, r: 16, t: 8, b: 36 },
+  xaxis: { gridcolor: "#232c3b", zerolinecolor: "#232c3b" },
+  yaxis: { gridcolor: "#232c3b", zerolinecolor: "#232c3b" },
+  legend: { orientation: "h", y: -0.2, font: { size: 10 } },
+  showlegend: true,
+};
+const PLOT_CONFIG = { displayModeBar: false, responsive: true };
+
+function buildTraces(group, companyData) {
+  const periods = companyData.periods;
+  const traces = [];
+  let ci = 0;
+  (group.metrics || []).forEach((metric) => {
+    const s = companyData.series[metric];
+    if (!s || s.values.every((v) => v == null)) return; // nothing to plot
+    const color = CHART_COLORS[ci++ % CHART_COLORS.length];
+    traces.push(
+      group.kind === "bar"
+        ? { type: "bar", x: periods, y: s.values, name: s.label,
+            marker: { color } }
+        : { type: "scatter", mode: "lines+markers", x: periods, y: s.values,
+            name: s.label, line: { color, width: 2 },
+            marker: { color, size: 6 }, connectgaps: false }
+    );
+  });
+  return traces;
+}
+
+// Render a prompt-driven chart spec ({company, title, kind, periods, series})
+// as a Plotly card appended to a message. Returns the card node, or null if
+// Plotly is unavailable / the spec is empty.
+function renderChartCard(chart) {
+  if (!chart || !window.Plotly || !chart.series?.length) return null;
+  const card = el("div", "dash-card chat-chart");
+  card.appendChild(Object.assign(el("div", "dash-card-title"),
+    { textContent: chart.title }));
+  const plot = el("div", "dash-plot");
+  card.appendChild(plot);
+
+  const traces = chart.series.map((s, i) => {
+    const color = CHART_COLORS[i % CHART_COLORS.length];
+    return chart.kind === "bar"
+      ? { type: "bar", x: chart.periods, y: s.values, name: s.label,
+          marker: { color } }
+      : { type: "scatter", mode: "lines+markers", x: chart.periods,
+          y: s.values, name: s.label, line: { color, width: 2 },
+          marker: { color, size: 6 }, connectgaps: false };
+  });
+  // Plot after the node is attached so Plotly sizes to the container.
+  setTimeout(() => Plotly.newPlot(plot, traces,
+    { ...PLOT_LAYOUT, barmode: "group" }, PLOT_CONFIG), 0);
+  return card;
+}
+
+async function openDashboard() {
+  activeChatId = null;
+  setComposerEnabled(false);
+  await refreshSidebar(); // clears the active highlight
+  activeUploads = [];
+  renderAttachedStrip();
+
+  const pane = $("#messages");
+  pane.innerHTML = "";
+  const wrap = el("div", "dashboard");
+  wrap.appendChild(Object.assign(el("h2", "dash-title"),
+    { textContent: "Financial Dashboard" }));
+  pane.appendChild(wrap);
+
+  if (!window.Plotly) {
+    wrap.appendChild(Object.assign(el("div", "dash-empty"), {
+      textContent: "⚠️ Charts need Plotly, which failed to load (offline?). "
+        + "The data endpoint still works at /api/dashboard.",
+    }));
+    return;
+  }
+
+  let payload;
+  try {
+    payload = await getDashboard();
+  } catch (e) {
+    wrap.appendChild(Object.assign(el("div", "dash-empty"),
+      { textContent: "⚠️ Failed to load dashboard: " + e.message }));
+    return;
+  }
+
+  if (!payload.companies.length) {
+    wrap.appendChild(Object.assign(el("div", "dash-empty"), {
+      textContent: "No financial facts yet. Ask some numeric questions, or run "
+        + "the backfill, to populate the dashboard.",
+    }));
+    return;
+  }
+
+  payload.companies.forEach((company) => {
+    const cData = payload.data[company];
+    const section = el("div", "dash-company");
+    section.appendChild(Object.assign(el("h3", "dash-company-name"),
+      { textContent: company.toUpperCase() }));
+
+    const grid = el("div", "dash-grid");
+    payload.default_charts.forEach((group) => {
+      const traces = buildTraces(group, cData);
+      if (!traces.length) return; // skip charts with no data for this company
+      const card = el("div", "dash-card");
+      card.appendChild(Object.assign(el("div", "dash-card-title"),
+        { textContent: group.title }));
+      const plot = el("div", "dash-plot");
+      card.appendChild(plot);
+      grid.appendChild(card);
+      // Plot after the node is in the DOM so Plotly can size to the container.
+      Plotly.newPlot(plot, traces,
+        { ...PLOT_LAYOUT, barmode: "group" }, PLOT_CONFIG);
+    });
+
+    if (!grid.children.length) {
+      section.appendChild(Object.assign(el("div", "dash-empty"),
+        { textContent: "No chartable metrics for this company yet." }));
+    } else {
+      section.appendChild(grid);
+    }
+    wrap.appendChild(section);
+  });
+}
+
 // --- actions -----------------------------------------------------------------
 async function openChat(id) {
   activeChatId = id;
@@ -463,7 +600,11 @@ async function sendQuestion(question) {
     // work on this" before the new answer they're about to read.
     const recallPanel = renderRecallPanel(res.recall, question);
     if (recallPanel) $("#messages").appendChild(recallPanel);
-    addMessage(res.assistant_message);
+    const msgNode = addMessage(res.assistant_message);
+    // Prompt-driven chart: drop a Plotly card into the assistant bubble when
+    // the backend resolved one for this question.
+    const chartCard = renderChartCard(res.chart);
+    if (chartCard) { msgNode.appendChild(chartCard); scrollToBottom(); }
     await refreshSidebar();
   } catch (err) {
     pending.classList.remove("pending");
@@ -483,6 +624,7 @@ function setComposerEnabled(enabled) {
 
 // --- wire up events ----------------------------------------------------------
 $("#new-chat-btn").addEventListener("click", startNewChat);
+$("#dashboard-btn").addEventListener("click", openDashboard);
 
 $("#composer").addEventListener("submit", (e) => {
   e.preventDefault();

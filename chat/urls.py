@@ -15,6 +15,9 @@ urlpatterns = [
     path("chats/<int:chat_id>/uploads/<int:upload_id>",
          views.chat_upload_detail, name="chat-upload-detail"),
     path("modes", views.mode_list, name="mode-list"),
+    # Cross-document financial dashboard: chart-ready series straight from
+    # MetricFact (SQL only, no RAG). Optional ?company=<slug>.
+    path("dashboard", views.dashboard_data, name="dashboard-data"),
     # Slice-3: lookup past analyses matching a draft question. Used by the
     # composer to surface "you asked something like this before" before the
     # user even hits send.

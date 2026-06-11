@@ -13,9 +13,10 @@
       <div class="sidebar-head">
         <h1>FinRAG</h1>
         <button id="new-chat-btn" title="Start a new chat">+ New Query</button>
+        <button id="dashboard-btn" title="Cross-document financial dashboard">📊 Dashboard</button>
       </div>
       <ul id="chat-list"><!-- chats injected by app.js --></ul>
-      <div class="sidebar-foot">Local RAG · gpt-oss:20b</div>
+      <div class="sidebar-foot">Local RAG · minimax-m3</div>
     </aside>
 
     <!-- RIGHT: the active conversation -->
@@ -60,6 +61,10 @@
   </div>
 
   <script src="/static/marked.min.js"></script>
+  <!-- Plotly for the financial dashboard charts. CDN (the app already needs
+       network for the Ollama cloud model); app.js degrades gracefully if it
+       fails to load. -->
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
