@@ -13,8 +13,11 @@ st.caption(f"Local RAG over your PDFs · {config.LLM_MODEL} · top-{config.TOP_K
 
 @st.cache_resource(show_spinner="Loading LLM...")
 def load_llm():
-    return ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
-                      temperature=0, timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+    # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+    # return ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
+    #                   temperature=0, timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+    import llm_provider
+    return llm_provider.make_chat(temperature=0)
 
 llm = load_llm()
 

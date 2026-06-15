@@ -16,3 +16,4 @@ djangorestframework
 django-cors-headers
 redis
 sentence-transformers
+langchain-openai

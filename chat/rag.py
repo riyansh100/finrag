@@ -20,12 +20,15 @@ def get_llm():
     """One ChatOllama instance for the whole process."""
     global _llm
     if _llm is None:
-        _llm = ChatOllama(
-            model=config.LLM_MODEL,
-            base_url=config.OLLAMA_BASE_URL,
-            temperature=0,
-            timeout=config.LLM_REQUEST_TIMEOUT_SEC,
-        )
+        # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+        # _llm = ChatOllama(
+        #     model=config.LLM_MODEL,
+        #     base_url=config.OLLAMA_BASE_URL,
+        #     temperature=0,
+        #     timeout=config.LLM_REQUEST_TIMEOUT_SEC,
+        # )
+        import llm_provider
+        _llm = llm_provider.make_chat(temperature=0)
     return _llm
 
 

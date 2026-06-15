@@ -206,13 +206,16 @@ def _get_llm():
     """Lazy ChatOllama in JSON mode. Temperature 0 so extraction is stable."""
     global _LLM
     if _LLM is None:
-        _LLM = ChatOllama(
-            model=config.LLM_MODEL,
-            base_url=config.OLLAMA_BASE_URL,
-            temperature=0,
-            format="json",
-            timeout=config.LLM_REQUEST_TIMEOUT_SEC,
-        )
+        # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+        # _LLM = ChatOllama(
+        #     model=config.LLM_MODEL,
+        #     base_url=config.OLLAMA_BASE_URL,
+        #     temperature=0,
+        #     format="json",
+        #     timeout=config.LLM_REQUEST_TIMEOUT_SEC,
+        # )
+        import llm_provider
+        _LLM = llm_provider.make_chat(temperature=0, json_mode=True)
     return _LLM
 
 

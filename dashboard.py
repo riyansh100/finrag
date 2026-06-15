@@ -148,6 +148,23 @@ def has_chart_intent(question: str) -> bool:
     return bool(_CHART_INTENT_RE.search(question or ""))
 
 
+def _metrics_from_text(question: str) -> list[str]:
+    """Canonical metric keys named directly in the question text — a word-boundary
+    scan over the metric aliases. LLM-free, so prompt-charts pick the right
+    metric even when the slot extractor didn't run. Longest aliases first so
+    'operating margin' wins over 'operating profit' when both could match."""
+    import facts as facts_lib
+    q = (question or "").lower()
+    found = []
+    for key, aliases in facts_lib.CANONICAL_METRICS.items():
+        for alias in sorted(aliases, key=len, reverse=True):
+            if re.search(r"\b" + re.escape(alias.lower()) + r"\b", q):
+                if key not in found:
+                    found.append(key)
+                break
+    return found
+
+
 def chart_for_question(question: str, slots: dict | None) -> dict | None:
     """Build a chart spec for a prompt that asks to visualise something, or
     None if there's no chart intent / not enough data.
@@ -171,14 +188,20 @@ def chart_for_question(question: str, slots: dict | None) -> dict | None:
         return None
     company = companies[0]
 
-    # Resolve requested metrics -> canonical keys. Fall back to revenue when the
-    # user said "trend"/"chart" without naming a metric.
+    # Resolve requested metrics -> canonical keys. Priority:
+    #   1. metrics the LLM slot extractor found (when it ran);
+    #   2. metrics named directly in the question text (regex over the metric
+    #      aliases) -- this keeps charts correct even when the LLM is down /
+    #      unauthenticated, which is exactly when slots["metrics"] is empty;
+    #   3. revenue, as a last-resort default for a bare "chart/trend".
     import facts as facts_lib
     wanted = []
     for m in (slots.get("metrics") or []):
         key = facts_lib.canonicalize_metric(m)
         if key and key not in wanted:
             wanted.append(key)
+    if not wanted:
+        wanted = _metrics_from_text(question)
     if not wanted:
         wanted = ["revenue"]
 

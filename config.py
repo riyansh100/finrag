@@ -1,9 +1,25 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
+# --- LLM provider -----------------------------------------------------------
+# Which backend builds the chat model. All call sites go through
+# llm_provider.make_chat(), so flipping this is the ONLY change needed to
+# switch providers. "openrouter" | "ollama".
+LLM_PROVIDER = "openrouter"
+
+# OpenRouter (OpenAI-compatible). The API key MUST come from the environment —
+# never hardcode it in the repo:
+#     export OPENROUTER_API_KEY="sk-or-v1-..."
+# Pick any chat/instruct model; verify the exact slug on openrouter.ai/models.
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL    = "nvidia/nemotron-3-super-120b-a12b:free"
+
+# Ollama model (used when LLM_PROVIDER == "ollama").
 LLM_MODEL = "minimax-m3:cloud"
 # Hard ceiling on a single LLM call. Cloud Ollama occasionally accepts a
 # request and then stops streaming -- without this, the chat UI just blinks

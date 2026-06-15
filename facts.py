@@ -247,13 +247,16 @@ def _get_extractor_llm():
     """Lazy ChatOllama in JSON mode, temperature 0 (deterministic extraction)."""
     global _EXTRACTOR_LLM
     if _EXTRACTOR_LLM is None:
-        _EXTRACTOR_LLM = ChatOllama(
-            model=config.LLM_MODEL,
-            base_url=config.OLLAMA_BASE_URL,
-            temperature=0,
-            format="json",
-            timeout=config.LLM_REQUEST_TIMEOUT_SEC,
-        )
+        # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+        # _EXTRACTOR_LLM = ChatOllama(
+        #     model=config.LLM_MODEL,
+        #     base_url=config.OLLAMA_BASE_URL,
+        #     temperature=0,
+        #     format="json",
+        #     timeout=config.LLM_REQUEST_TIMEOUT_SEC,
+        # )
+        import llm_provider
+        _EXTRACTOR_LLM = llm_provider.make_chat(temperature=0, json_mode=True)
     return _EXTRACTOR_LLM
 
 

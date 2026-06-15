@@ -18,6 +18,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
 
 import config
+import llm_provider
 from ingest import author_from_filename
 from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
@@ -1225,8 +1226,10 @@ def rewrite_query(question, history, llm=None):
         return question
     if _is_self_contained(question):
         return question
-    llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
-                            temperature=0, timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+    # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+    # llm = llm or ChatOllama(model=config.LLM_MODEL, base_url=config.OLLAMA_BASE_URL,
+    #                         temperature=0, timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+    llm = llm or llm_provider.make_chat(temperature=0)
     chain = REWRITE_PROMPT | llm | StrOutputParser()
     rewritten = chain.invoke({
         "history": _history_to_messages(history),
@@ -1323,10 +1326,12 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None,
     if llm is not None and mode is None:
         pass  # use the caller's llm
     else:
-        llm = ChatOllama(model=config.LLM_MODEL,
-                         base_url=config.OLLAMA_BASE_URL,
-                         temperature=mode_cfg["temperature"],
-                         timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+        # --- Ollama (kept as fallback; flip config.LLM_PROVIDER="ollama") ---
+        # llm = ChatOllama(model=config.LLM_MODEL,
+        #                  base_url=config.OLLAMA_BASE_URL,
+        #                  temperature=mode_cfg["temperature"],
+        #                  timeout=config.LLM_REQUEST_TIMEOUT_SEC)
+        llm = llm_provider.make_chat(temperature=mode_cfg["temperature"])
 
     # Mode-specific prompt template. History placeholder + human turn match the
     # original PROMPT layout exactly.

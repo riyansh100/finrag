@@ -4,13 +4,25 @@ Local-first RAG chatbot for financial PDFs (quarterly reports, annual filings). 
 
 On top of RAG sits a **three-layer analytics stack** (Redis cache → SQLite facts → RAG) that turns every answer into structured rows the bot reuses on future questions.
 
+On top of *that* sits a **financial dashboard** — Plotly charts (revenue/margin/balance-sheet trends) rendered straight from the `MetricFact` table (SQL only, no LLM), plus prompt-driven charts in chat (`plot infosys revenue trend`).
+
+---
+
+## What's new (latest)
+
+- **Atomized retrieval.** Multi-company / multi-period questions are decomposed into `(company × period)` atoms (`nlu.build_atoms`); each atom gets its own hard-filtered retrieval pass so no cell crowds out the others. Fixes the "one period/company dominated the context" failure.
+- **Swappable LLM provider.** `config.LLM_PROVIDER` (`"ollama" | "openrouter"`) routes all 6 chat-model sites through one factory (`llm_provider.make_chat`). OpenRouter is OpenAI-compatible; JSON mode is translated per provider. Old Ollama lines kept commented for instant revert.
+- **Fact backfill.** `backfill.py` populates `MetricFact` from existing corpus chunks (not query-time) — reuses the `facts.py` extractor, batches large docs, **caches per-doc to disk so it's resumable and quota is spent once**.
+- **Dashboard + prompt charts.** `dashboard.py` (data layer) + `GET /api/dashboard` + Plotly frontend. Pure SQL/ORM, zero LLM. Metric detection works LLM-free (regex over metric aliases).
+- **Eval suite rebuilt** for the infosys/riil corpus (17 cases, scores atom routing too): `evals/run.py --retrieval` 101/101, full 117/118.
+
 ---
 
 ## Stack
 
 | Layer            | Choice                                                                              |
 | ---------------- | ----------------------------------------------------------------------------------- |
-| LLM              | `gpt-oss:20b-cloud` via Ollama Cloud (any local Ollama chat model works)            |
+| LLM              | Swappable via `LLM_PROVIDER`: OpenRouter (OpenAI-compatible) or Ollama (`minimax-m3:cloud`) |
 | Embeddings       | `nomic-embed-text` (768-dim) with `search_query:` / `search_document:` prefixes     |
 | Vector store     | ChromaDB (cosine), persisted to disk                                                |
 | Keyword search   | `rank-bm25` via LangChain `BM25Retriever`                                           |
@@ -21,6 +33,7 @@ On top of RAG sits a **three-layer analytics stack** (Redis cache → SQLite fac
 | Memory (chat)    | LLM rewriter + last `HISTORY_TURNS` messages                                        |
 | Memory (facts)   | Redis (L1) → SQLite `MetricFact` (L2) → RAG (L3)                                    |
 | Backend          | Django + DRF, SQLite (`Chat`, `Message`, `MetricFact`, `AnalysisNote`)              |
+| Dashboard        | `dashboard.py` (SQL over `MetricFact`) + Plotly.js (CDN) — charts, no LLM           |
 | Frontend         | Plain HTML/CSS/JS, `marked.min.js` vendored                                         |
 
 Everything except the chat LLM runs locally. Redis is optional — the cache silently falls back to SQLite if it's unreachable.
@@ -47,8 +60,11 @@ finrag/
 ├── reranker.py               # Cross-encoder reranker (stage 2 of retrieval)
 ├── query.py                  # Hybrid retrieval + intent + RAG chain + cache hook
 ├── modes.py                  # Mode registry: Extract / Analyze / Compare
-├── nlu.py                    # LLM-based structured slot extraction (with regex fallback)
+├── nlu.py                    # LLM slot extraction + build_atoms() (with regex fallback)
 ├── facts.py                  # Post-answer fact extractor + persistence
+├── backfill.py               # Ingest-time MetricFact backfill from corpus (cached, resumable)
+├── dashboard.py              # SQL → chart-ready series + prompt-driven chart specs (no LLM)
+├── llm_provider.py           # Provider factory: OpenRouter | Ollama (config.LLM_PROVIDER)
 ├── cache.py                  # Redis L1 + SQLite L2 fact cache
 ├── recall.py                 # Scope-overlap match for "related past analysis"
 └── manage.py
@@ -87,7 +103,8 @@ question
   │                                      # shortlist; anchors/statement-bonus chunks are
   │                                      # pinned at the front by content key
   │
-  ├─ PROMPT[mode] | ChatOllama           # mode = extract | analyze | compare
+  ├─ PROMPT[mode] | llm_provider.make_chat()  # mode = extract | analyze | compare
+  │                                      # provider = openrouter | ollama (config.LLM_PROVIDER)
   │
   ├─ facts.process_assistant_message()   # 2nd LLM pass extracts {company, period, metric, value, unit}
   │                                      # → MetricFact upsert + FactProvenance log + Redis write-through
@@ -158,8 +175,10 @@ nlu.extract_slots("infy topline last 3 fiscals")
 
 | Setting                          | Default                          |
 | -------------------------------- | -------------------------------- |
-| `LLM_MODEL`                      | `gpt-oss:20b-cloud`              |
-| `LLM_REQUEST_TIMEOUT_SEC`        | `120` (hard ceiling on every ChatOllama call) |
+| `LLM_PROVIDER`                   | `openrouter` (or `ollama`)       |
+| `OPENROUTER_MODEL` / `OPENROUTER_API_KEY` | model slug / from `$OPENROUTER_API_KEY` env |
+| `LLM_MODEL`                      | `minimax-m3:cloud` (used when provider=ollama) |
+| `LLM_REQUEST_TIMEOUT_SEC`        | `120` (hard ceiling on every LLM call) |
 | `EMBEDDING_MODEL`                | `nomic-embed-text`               |
 | `CHUNK_SIZE` / `OVERLAP`         | `1000` / `200`                   |
 | `TOP_K`                          | `8` (modes can bump to 12)       |
@@ -185,6 +204,7 @@ Schema-affecting changes (embedding model, chunk size, ingest headers) require w
 | Method | Path                       | Body                       | Returns                                         |
 | ------ | -------------------------- | -------------------------- | ----------------------------------------------- |
 | GET    | `/modes`                   | —                          | `{modes, default}`                              |
+| GET    | `/dashboard?company=<slug>` | —                         | Chart-ready series from `MetricFact` (SQL, no RAG) |
 | GET    | `/chats`                   | —                          | List of chats                                   |
 | POST   | `/chats`                   | `{title?}`                 | New chat                                        |
 | GET    | `/chats/{id}`              | —                          | Chat + full message list                        |
@@ -209,6 +229,31 @@ Models: `Chat`, `Message`, `MetricFact`, `FactProvenance`, `AnalysisNote`, `Uplo
 | `compare` | 12    | `## Framing / ## Comparison table / ## Deltas & interpretation / ## Bottom line` |
 
 Mode is per-message and user-picked. Base prompt enforces Indian FY mapping (Q1=Apr–Jun … Q3=Oct–Dec), currency discipline (never mix ₹ with $), refuse rather than fabricate, and treat `[CACHED-FACTS]` chunks as authoritative.
+
+---
+
+## Fact backfill (`backfill.py`)
+
+Query-time extraction only fills `MetricFact` for what's been asked. Backfill front-fills it from the corpus so the dashboard has dense data:
+
+```bash
+python backfill.py --doc q1-2024.pdf      # dry run, one doc (prints facts)
+python backfill.py --all --persist        # write every doc to MetricFact
+```
+
+- Reuses the validated `facts.py` extractor (feeds report chunk text + an explicit `company/period` hint).
+- Batches large docs under a char budget (annual reports → several calls, tables only).
+- **Caches each doc's facts to `backfill_cache/<doc>.json`** → re-runs and `--persist` cost no LLM; safe to Ctrl+C and resume (finished docs skip).
+
+---
+
+## Dashboard & charts (`dashboard.py`)
+
+Pure SQL over `MetricFact` — **no RAG, no LLM, no cloud calls.**
+
+- **Dashboard view** — sidebar 📊 button → `GET /api/dashboard` → Plotly charts (Revenue / Profitability / Margins % / Balance sheet) per company. Series are aligned to a chronological period axis, INR/USD collapsed to one line, gaps as nulls.
+- **Prompt-driven charts** — `dashboard.chart_for_question()` detects chart intent (regex), a single company, and metric(s), and attaches a `chart` spec to the message response. Metric detection is **LLM-free** (regex over `facts.CANONICAL_METRICS` aliases), so charts pick the right metric even when the model is down.
+- A metric needs ≥ 2 non-null points to auto-chart.
 
 ---
 
@@ -241,11 +286,12 @@ Hybrid BM25+vector is stage 1: cheap and shallow. Stage 2 feeds `[question, chun
 ```bash
 brew install tesseract ghostscript redis    # macOS
 brew services start redis                    # optional but recommended
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text                 # embeddings (local, required)
 ollama pull granite3.2-vision:2b             # optional, figures only
-ollama signin                                # gpt-oss:20b-cloud (default)
-# OR fully offline:
-ollama pull llama3.1:8b && # set LLM_MODEL in config.py
+
+# Chat LLM — pick a provider in config.py (LLM_PROVIDER):
+#   openrouter (default): export OPENROUTER_API_KEY="sk-or-v1-..."   # add to ~/.zshrc to persist
+#   ollama:               ollama signin       # minimax-m3:cloud, or pull llama3.1:8b for offline
 
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
