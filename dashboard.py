@@ -122,6 +122,16 @@ def company_series(company: str | None = None,
         for unit_map in metric_map.values():
             for per_map in unit_map.values():
                 periods.update(per_map.keys())
+        # Keep ONE granularity. If the company has quarterly periods (QxFYyy),
+        # drop the bare annual ones (FYyy) — they come from a single "year
+        # ended" column in a quarterly report, so they're sparse and mixing
+        # them into the quarterly axis just makes a confusing gap (the stray
+        # "FY22" between Q3FY22 and Q1FY23).
+        has_quarterly = any(_PERIOD_RE.match(p) and _PERIOD_RE.match(p).group(1)
+                            for p in periods)
+        if has_quarterly:
+            periods = {p for p in periods
+                       if _PERIOD_RE.match(p) and _PERIOD_RE.match(p).group(1)}
         period_axis = sorted(periods, key=period_sort_key)
 
         series = {}

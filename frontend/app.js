@@ -422,10 +422,16 @@ const PLOT_LAYOUT = {
   paper_bgcolor: "transparent",
   plot_bgcolor: "transparent",
   font: { family: "'IBM Plex Mono', monospace", color: "#8a97a8", size: 11 },
-  margin: { l: 56, r: 16, t: 8, b: 36 },
-  xaxis: { gridcolor: "#232c3b", zerolinecolor: "#232c3b" },
-  yaxis: { gridcolor: "#232c3b", zerolinecolor: "#232c3b" },
-  legend: { orientation: "h", y: -0.2, font: { size: 10 } },
+  // Legend sits ABOVE the plot so it never collides with the (angled, dense)
+  // period labels along the x-axis. automargin lets Plotly reserve room for
+  // the rotated tick text.
+  margin: { l: 56, r: 16, t: 30, b: 16 },
+  xaxis: {
+    gridcolor: "#232c3b", zerolinecolor: "#232c3b",
+    tickangle: -45, automargin: true, tickfont: { size: 9 },
+  },
+  yaxis: { gridcolor: "#232c3b", zerolinecolor: "#232c3b", automargin: true },
+  legend: { orientation: "h", y: 1.12, x: 0, font: { size: 9 } },
   showlegend: true,
 };
 const PLOT_CONFIG = { displayModeBar: false, responsive: true };
@@ -436,7 +442,9 @@ function buildTraces(group, companyData) {
   let ci = 0;
   (group.metrics || []).forEach((metric) => {
     const s = companyData.series[metric];
-    if (!s || s.values.every((v) => v == null)) return; // nothing to plot
+    // Need >= 2 real points to be a trend; a single dot (e.g. RIIL's lone
+    // FY25) just renders a confusing floating marker, so skip it.
+    if (!s || s.values.filter((v) => v != null).length < 2) return;
     const color = CHART_COLORS[ci++ % CHART_COLORS.length];
     traces.push(
       group.kind === "bar"
@@ -444,7 +452,7 @@ function buildTraces(group, companyData) {
             marker: { color } }
         : { type: "scatter", mode: "lines+markers", x: periods, y: s.values,
             name: s.label, line: { color, width: 2 },
-            marker: { color, size: 6 }, connectgaps: false }
+            marker: { color, size: 6 }, connectgaps: true }
     );
   });
   return traces;
@@ -468,7 +476,7 @@ function renderChartCard(chart) {
           marker: { color } }
       : { type: "scatter", mode: "lines+markers", x: chart.periods,
           y: s.values, name: s.label, line: { color, width: 2 },
-          marker: { color, size: 6 }, connectgaps: false };
+          marker: { color, size: 6 }, connectgaps: true };
   });
   // Plot after the node is attached so Plotly sizes to the container.
   setTimeout(() => Plotly.newPlot(plot, traces,
@@ -537,8 +545,13 @@ async function openDashboard() {
     });
 
     if (!grid.children.length) {
-      section.appendChild(Object.assign(el("div", "dash-empty"),
-        { textContent: "No chartable metrics for this company yet." }));
+      const np = (cData.periods || []).length;
+      section.appendChild(Object.assign(el("div", "dash-empty"), {
+        textContent: np <= 1
+          ? `Only ${np} period of data (${(cData.periods || []).join(", ")}) — `
+            + "need at least 2 to chart a trend."
+          : "No chartable metrics for this company yet.",
+      }));
     } else {
       section.appendChild(grid);
     }
