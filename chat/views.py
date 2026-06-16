@@ -351,6 +351,9 @@ def message_create(request, chat_id):
             # Prompt-driven chart spec (or null). Transient — not persisted on
             # the Message; re-rendered only for this live turn.
             "chart": chart,
+            # Self-verify badge data (or null): {status, traced, checked,
+            # unverified}. Transient — rendered under the answer this turn.
+            "verification": result.get("verification"),
             # Slice-3: prior analyses with overlapping scope. List of
             # {id, message_id, chat_id, mode, scope, score, created_at,
             #  preview, body_length}. Empty when nothing matched. Frontend

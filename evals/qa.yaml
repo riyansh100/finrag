@@ -38,6 +38,7 @@ cases:
     expect_numeric: true
     expect_substrings: ["31,322"]            # 131322
     forbid_substrings: ["cannot provide", "private compan"]
+    expect_verify: clean                     # figures should trace to source/facts
 
   - question: "infosys total equity for Q1 FY24"
     expect_source: q1-2024.pdf
@@ -47,6 +48,7 @@ cases:
     expect_atoms: false
     expect_numeric: true
     expect_substrings: ["74,828"]
+    expect_verify: clean
 
   - question: "what was infosys revenue in Q1 FY25"
     expect_source: q1-2025.pdf
@@ -216,6 +218,7 @@ cases:
     expect_numeric: false
     expect_substrings: []
     forbid_substrings: ["sunny", "rain", "celsius", "fahrenheit", "degrees"]
+    expect_verify: "n/a"                      # a refusal has no figures to trace
     notes: "Off-topic. Model must refuse rather than fabricate weather data."
 
   - question: "what was infosys revenue in Q4 FY27"

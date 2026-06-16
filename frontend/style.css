@@ -696,3 +696,25 @@ html, body {
   font-size: 13px;
   padding: 16px 4px;
 }
+
+/* --- self-verify badge ---------------------------------------------------- */
+.verify-badge {
+  margin-top: 8px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  display: inline-block;
+}
+.verify-badge.clean {
+  color: var(--green);
+  background: rgba(46, 204, 113, 0.08);
+  border: 1px solid rgba(46, 204, 113, 0.35);
+}
+.verify-badge.flagged {
+  color: var(--red);
+  background: rgba(255, 92, 92, 0.08);
+  border: 1px solid rgba(255, 92, 92, 0.4);
+  cursor: help;
+}

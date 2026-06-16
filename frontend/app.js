@@ -411,6 +411,27 @@ function readyUploadIds() {
     .map((u) => u.id);
 }
 
+// Render the self-verify badge under an answer. `v` = {status, traced,
+// checked, unverified}. Deterministic figure-tracing from the backend (no LLM):
+//   clean   -> all comma-grouped figures found in a source
+//   flagged -> some figures couldn't be traced (possible hallucination)
+//   n/a     -> nothing numeric to check (no badge)
+function renderVerifyBadge(v) {
+  if (!v || v.status === "n/a" || !v.checked) return null;
+  const badge = el("div", `verify-badge ${v.status}`);
+  if (v.status === "clean") {
+    badge.textContent = `✓ ${v.traced}/${v.checked} figures traced to sources`;
+  } else {
+    const list = v.unverified.slice(0, 4).join(", ")
+      + (v.unverified.length > 4 ? "…" : "");
+    badge.textContent =
+      `⚠ ${v.unverified.length} of ${v.checked} figures unverified: ${list}`;
+    badge.title = "These numbers weren't found in the retrieved sources or the "
+      + "metric store — double-check them.";
+  }
+  return badge;
+}
+
 // --- dashboard (cross-document charts) ---------------------------------------
 // Pure read of /api/dashboard (SQL over MetricFact, no RAG). Renders one
 // Plotly chart per default grouping, per company. Series come pre-aligned to a
@@ -614,6 +635,9 @@ async function sendQuestion(question) {
     const recallPanel = renderRecallPanel(res.recall, question);
     if (recallPanel) $("#messages").appendChild(recallPanel);
     const msgNode = addMessage(res.assistant_message);
+    // Self-verify badge: figures traced to sources, or flagged as unverified.
+    const verifyBadge = renderVerifyBadge(res.verification);
+    if (verifyBadge) msgNode.appendChild(verifyBadge);
     // Prompt-driven chart: drop a Plotly card into the assistant bubble when
     // the backend resolved one for this question.
     const chartCard = renderChartCard(res.chart);

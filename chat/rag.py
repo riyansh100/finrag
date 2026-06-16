@@ -117,4 +117,6 @@ def run_query(question, history, mode=None, upload_ids=None,
         "recall": result.get("recall") or [],
         # Slice-4: which uploaded PDFs (if any) were searched for this turn.
         "upload_ids": result.get("upload_ids") or [],
+        # Self-verify: deterministic figure-tracing result (or None).
+        "verification": result.get("verification"),
     }

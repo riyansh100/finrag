@@ -19,6 +19,7 @@ from langchain_classic.retrievers.ensemble import EnsembleRetriever
 
 import config
 import llm_provider
+import verify as answer_verify
 from ingest import author_from_filename
 from embeddings import make_vectorstore
 from modes import DEFAULT_MODE, get_mode
@@ -1574,6 +1575,16 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None,
         "metrics": nlu_metrics,
     }
 
+    # Self-verify (deterministic, no LLM): trace every comma-grouped figure in
+    # the answer back to the retrieved context or MetricFact. Skipped when we
+    # didn't generate an answer (chart questions). Fault-tolerant.
+    verification = None
+    if not skip_generation and answer:
+        try:
+            verification = answer_verify.verify_answer(answer, docs, slots_out)
+        except Exception as e:
+            print(f"  [verify] failed ({type(e).__name__}: {str(e)[:120]})")
+
     # Slice-3 proactive recall: find past AnalysisNotes whose scope overlaps
     # this question, so the frontend can surface "you asked this before".
     # Runs AFTER the answer so a slow DB read can't delay the response; uses
@@ -1600,6 +1611,9 @@ def ask(question, history=None, llm=None, mode=None, upload_ids=None,
         "companies": sorted(all_companies) if len(all_companies) >= 2 else None,
         "mode": mode_name,
         "slots": slots_out,
+        # Self-verify result (deterministic figure-tracing) or None. Frontend
+        # renders a "figures traced / unverified" badge under the answer.
+        "verification":         verification,
         # Cache diagnostics so the frontend can render "served from cache"
         # badges and we can track hit rate in logs.
         "cache_hits":           len(cached_facts),

@@ -100,6 +100,7 @@ def run_case(idx, case, retrieval_only=False):
     company = result.get("company_filter")
     period = result.get("period_filter")
     atoms_fired = bool(result.get("atoms"))
+    verification = result.get("verification")
     elapsed = time.time() - t0
 
     checks = []
@@ -146,6 +147,17 @@ def run_case(idx, case, retrieval_only=False):
         )
         checks.append(("answer", ok))
         print(_fmt(ok, "answer", detail))
+
+        if "expect_verify" in case:
+            exp = case["expect_verify"]
+            got = (verification or {}).get("status", "n/a")
+            ok = got == exp
+            checks.append(("verify", ok))
+            extra = ""
+            if verification and verification.get("unverified"):
+                extra = f" unverified={verification['unverified']}"
+            print(_fmt(ok, "verify", f"got={got!r} exp={exp!r}{extra}"))
+
         # show a 1-line preview
         first_line = (answer or "").strip().splitlines()[0] if answer else ""
         if first_line:
