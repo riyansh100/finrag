@@ -13,8 +13,33 @@ On top of *that* sits a **financial dashboard** — Plotly charts (revenue/margi
 - **Atomized retrieval.** Multi-company / multi-period questions are decomposed into `(company × period)` atoms (`nlu.build_atoms`); each atom gets its own hard-filtered retrieval pass so no cell crowds out the others. Fixes the "one period/company dominated the context" failure.
 - **Swappable LLM provider.** `config.LLM_PROVIDER` (`"ollama" | "openrouter"`) routes all 6 chat-model sites through one factory (`llm_provider.make_chat`). OpenRouter is OpenAI-compatible; JSON mode is translated per provider. Old Ollama lines kept commented for instant revert.
 - **Fact backfill.** `backfill.py` populates `MetricFact` from existing corpus chunks (not query-time) — reuses the `facts.py` extractor, batches large docs, **caches per-doc to disk so it's resumable and quota is spent once**.
-- **Dashboard + prompt charts.** `dashboard.py` (data layer) + `GET /api/dashboard` + Plotly frontend. Pure SQL/ORM, zero LLM. Metric detection works LLM-free (regex over metric aliases).
-- **Eval suite rebuilt** for the infosys/riil corpus (17 cases, scores atom routing too): `evals/run.py --retrieval` 101/101, full 117/118.
+- **Dashboard + prompt charts.** `dashboard.py` (data layer) + `GET /api/dashboard` + Plotly frontend. Pure SQL/ORM, zero LLM. Metric detection: LLM constrained to canonical keys, with an alias lookup as fallback.
+- **Self-verify (deterministic, 0 LLM).** `verify.py` traces every comma-grouped figure in an answer back to the retrieved context or `MetricFact`; the frontend shows a "✓ N figures traced" / "⚠ unverified" badge.
+- **Eval suite rebuilt** for the infosys/riil corpus (17 cases — scores atom routing AND verify status): `evals/run.py --retrieval` fast path, full run 117/118.
+
+---
+
+## Architecture at a glance
+
+```
+SETUP (one-time)
+  Source PDFs ──ingest+embed──▶ ChromaDB        (vector chunks)
+  Source PDFs ──backfill (LLM)─▶ MetricFact      (SQL facts table)
+
+LIVE (every question)
+  question
+     │
+     ▼
+  NLU (LLM)  who · when · what          ── companies/periods/metrics, intent
+     │
+     ├── chart request?  ──yes──▶ MetricFact (SQL) ──▶ caption + Plotly   [NO LLM]
+     │
+     └── no ──▶ Retrieve+rerank (ChromaDB) ──▶ LLM answer ──▶ self-verify  [LLM]
+                                                    │              │
+                                                    └─ saves facts ─┴─▶ MetricFact
+
+  blue path = uses LLM · green path (charts, verify, SQL) = no LLM
+```
 
 ---
 
@@ -64,6 +89,7 @@ finrag/
 ├── facts.py                  # Post-answer fact extractor + persistence
 ├── backfill.py               # Ingest-time MetricFact backfill from corpus (cached, resumable)
 ├── dashboard.py              # SQL → chart-ready series + prompt-driven chart specs (no LLM)
+├── verify.py                 # Deterministic figure-tracing (answer → sources / MetricFact)
 ├── llm_provider.py           # Provider factory: OpenRouter | Ollama (config.LLM_PROVIDER)
 ├── cache.py                  # Redis L1 + SQLite L2 fact cache
 ├── recall.py                 # Scope-overlap match for "related past analysis"
@@ -105,6 +131,10 @@ question
   │
   ├─ PROMPT[mode] | llm_provider.make_chat()  # mode = extract | analyze | compare
   │                                      # provider = openrouter | ollama (config.LLM_PROVIDER)
+  │
+  ├─ verify.verify_answer()              # deterministic: trace every comma-grouped figure in the
+  │                                      # answer to the context / MetricFact → "traced" or "UNVERIFIED"
+  │                                      # (no LLM; renders a badge under the answer)
   │
   ├─ facts.process_assistant_message()   # 2nd LLM pass extracts {company, period, metric, value, unit}
   │                                      # → MetricFact upsert + FactProvenance log + Redis write-through
@@ -209,7 +239,7 @@ Schema-affecting changes (embedding model, chunk size, ingest headers) require w
 | POST   | `/chats`                   | `{title?}`                 | New chat                                        |
 | GET    | `/chats/{id}`              | —                          | Chat + full message list                        |
 | DELETE | `/chats/{id}`              | —                          | 204                                             |
-| POST   | `/chats/{id}/messages`     | `{question, mode?, upload_ids?}` | `{user_message, assistant_message, recall, rewritten_query}` |
+| POST   | `/chats/{id}/messages`     | `{question, mode?, upload_ids?}` | `{user_message, assistant_message, recall, rewritten_query, chart, verification}` |
 | GET    | `/chats/{id}/uploads`      | —                          | List of `UploadedDoc` rows for this chat        |
 | POST   | `/chats/{id}/uploads`      | `multipart: file=<pdf>`    | `UploadedDoc` row; indexes the PDF into its own Chroma collection |
 | DELETE | `/chats/{id}/uploads/{upload_id}` | —                  | 204; drops collection, stored PDF, and the row  |
@@ -254,6 +284,19 @@ Pure SQL over `MetricFact` — **no RAG, no LLM, no cloud calls.**
 - **Dashboard view** — sidebar 📊 button → `GET /api/dashboard` → Plotly charts (Revenue / Profitability / Margins % / Balance sheet) per company. Series are aligned to a chronological period axis, INR/USD collapsed to one line, gaps as nulls.
 - **Prompt-driven charts** — `dashboard.chart_for_question()` detects chart intent (regex), a single company, and metric(s), and attaches a `chart` spec to the message response. Metric detection is **LLM-free** (regex over `facts.CANONICAL_METRICS` aliases), so charts pick the right metric even when the model is down.
 - A metric needs ≥ 2 non-null points to auto-chart.
+
+---
+
+## Self-verify (`verify.py`)
+
+After the LLM drafts an answer, every **comma-grouped figure** in it (e.g. `1,31,322`, `12,310`) is traced back to a source — **deterministically, with no extra LLM call**:
+
+- Allowed set = every number in the retrieved context chunks **+** the `MetricFact` values for the question's company.
+- A figure found in neither is flagged `UNVERIFIED`; the frontend renders a badge under the answer: `✓ 8/8 figures traced to sources` or `⚠ 1 figure unverified: …`.
+- Format-tolerant (`1,31,322` ≡ `131,322`), and deliberately **conservative**: only absolute comma-grouped figures are hard-checked, so years, quarters, page numbers, and legitimately-computed percentages don't trip false alarms.
+- Fault-tolerant and free — it only compares numbers already in hand, so it costs zero quota and never blocks the answer. Skipped for chart questions (the caption is already derived from `MetricFact`).
+
+This is the cheap 80%-hallucination-killer: a wrong or invented figure surfaces immediately instead of slipping past in prose.
 
 ---
 
@@ -332,7 +375,8 @@ CLI fallback: `python query.py "your question"`.
 - **Currency-aware retrieval.** Per-chunk INR/USD classifier (markers → EPS-symbol regex → magnitude fallback). USD chunks dropped when their INR twin exists, so the LLM can't misread `US$1,640M` as `₹1,640 cr`.
 - **Statement-target-aware anchor probes.** Balance-sheet / cash-flow / P&L queries each use their own keyword probe, with text chunks allowed to win when pdfplumber misses the table boundary.
 - **Recall is structured Jaccard, not embeddings.** Scope is a typed tuple; structured match is sharper than vector similarity for this use case.
-- **Fault tolerance throughout.** Cache, extractor, recall, reranker — every layer wrapped in try/except. Worst case is "slower RAG", never a broken answer.
+- **Deterministic self-verify, not an LLM judge.** Figures are traced to sources by number-matching against the context + `MetricFact` — zero extra LLM calls. The model does the fuzzy generation; cheap deterministic code does the checkable verification. Same split as metric detection (LLM constrained to canonical keys, alias lookup as fallback).
+- **Fault tolerance throughout.** Cache, extractor, recall, reranker, verify — every layer wrapped in try/except. Worst case is "slower RAG", never a broken answer.
 - **Bounded LLM calls.** `LLM_REQUEST_TIMEOUT_SEC` is applied to every `ChatOllama` instance so a hung cloud endpoint surfaces a friendly "unreachable" message instead of an infinite spinner.
 
 ---
