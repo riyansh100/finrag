@@ -257,8 +257,34 @@ def message_create(request, chat_id):
 
     user_msg = Message.objects.create(chat=chat, role=Message.USER, content=question)
 
+    # Chart questions ("plot/chart/trend ...") are DATA questions: answer them
+    # from MetricFact (SQL), not RAG. We resolve slots + retrieval but skip the
+    # answer LLM (saves a call AND avoids the LLM's chunk-only prose
+    # contradicting the chart, which reads the full structured series).
+    import dashboard as dashboard_layer
+    want_chart = dashboard_layer.has_chart_intent(question) and not valid_upload_ids
     result = rag.run_query(question, history=prior, mode=mode,
-                           upload_ids=valid_upload_ids)
+                           upload_ids=valid_upload_ids,
+                           skip_generation=want_chart)
+
+    chart = None
+    if want_chart:
+        try:
+            chart = dashboard_layer.chart_for_question(question,
+                                                       result.get("slots"))
+        except Exception as e:
+            print(f"  [chart] build failed ({type(e).__name__}: {str(e)[:120]})")
+        if chart:
+            # Consistent, deterministic caption from the same series.
+            result["answer"] = dashboard_layer.caption_for_chart(chart)
+        else:
+            # Chart intent but no chartable data -> a clear note, still no LLM.
+            result["answer"] = (
+                "I couldn't build that chart — it needs a single company and a "
+                "metric with at least two periods in the metric store. Try the "
+                "📊 Dashboard, or name one company + metric (e.g. "
+                "\"plot infosys revenue trend\")."
+            )
 
     assistant_msg = Message.objects.create(
         chat=chat,
@@ -277,11 +303,15 @@ def message_create(request, chat_id):
     # don't belong in the canonical MetricFact cache (they're per-chat,
     # ephemeral relative to the curated corpus). This keeps cross-chat recall
     # honest.
-    if valid_upload_ids:
+    # Chart questions never generated an LLM answer (the caption is derived from
+    # existing MetricFact rows), so there's nothing new to extract — and running
+    # the extractor would spend an LLM call we deliberately skipped.
+    skip_facts = bool(valid_upload_ids) or want_chart
+    if skip_facts:
         print(f"  [facts] msg#{assistant_msg.pk}: skipped "
-              f"(upload-augmented answer)")
+              f"({'chart' if want_chart else 'upload-augmented'} answer)")
     try:
-        if valid_upload_ids:
+        if skip_facts:
             slots = {}
             counters = {"extracted": 0}
         else:
@@ -312,18 +342,7 @@ def message_create(request, chat_id):
         chat.title = question[:80]
     chat.save(update_fields=["title", "updated_at"])
 
-    # Prompt-driven chart: if the question asked to visualise a single company's
-    # metric over time, build a chart spec from MetricFact (SQL, no LLM) so the
-    # frontend can render it next to the prose answer. Fault-tolerant — a chart
-    # hiccup must never break the answer.
-    chart = None
-    try:
-        import dashboard as dashboard_layer
-        chart = dashboard_layer.chart_for_question(question,
-                                                   result.get("slots"))
-    except Exception as e:
-        print(f"  [chart] build failed ({type(e).__name__}: {str(e)[:120]})")
-
+    # `chart` was built above (chart-intent questions); None otherwise.
     return Response(
         {
             "user_message": MessageSerializer(user_msg).data,

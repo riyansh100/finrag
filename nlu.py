@@ -39,6 +39,15 @@ def known_companies():
 
 
 @lru_cache(maxsize=1)
+def known_metrics():
+    """Canonical metric keys the extractor is allowed to emit. Same closed
+    vocabulary the fact store uses, so a metric the LLM picks maps 1:1 to a
+    MetricFact.metric_key (and to the dashboard's series)."""
+    from facts import CANONICAL_METRICS  # local import: avoid import cycle
+    return set(CANONICAL_METRICS.keys())
+
+
+@lru_cache(maxsize=1)
 def known_fys():
     """FYs actually present in data/ — scanned from filenames so we don't
     accept hallucinated years (e.g. 'FY30')."""
@@ -64,7 +73,7 @@ Output ONLY a JSON object with these keys:
   "companies":         array of company slugs from {companies_list}. Empty if none mentioned.
   "quarters":          array of integers 1-4. Empty if no quarter is named.
   "fys":               array of two-digit fiscal years. EXPAND ranges. "FY21 through FY26" -> [21,22,23,24,25,26]. "last 3 fiscals" relative to FY26 -> [24,25,26]. Empty if none.
-  "metrics":           array of short metric names mentioned ("revenue", "operating profit", "EPS", "net profit"). Empty if none.
+  "metrics":           array of canonical metric KEYS, chosen ONLY from this list: {metrics_list}. Map the user's wording to the closest key — "topline"/"sales" -> revenue, "ROE" -> roe_pct, "EPS" -> eps_basic, "net profit"/"PAT" -> pat, "operating margin" -> operating_margin_pct, "net margin" -> pat_margin_pct, a bare "margins" -> BOTH operating_margin_pct and pat_margin_pct. Use only keys from the list; omit anything you cannot map. Empty if no metric is named.
   "statement_variant": "standalone", "consolidated", or null.
   "intent":            one of "lookup" (single value), "trend" (over time), "compare" (across companies/periods), "explain" (qualitative).
 
@@ -101,6 +110,7 @@ def _build_system_prompt():
     latest_fy = max(fys) if fys else 26
     return _EXTRACTION_SYSTEM.format(
         companies_list=companies,
+        metrics_list=sorted(known_metrics()),
         latest_fy=latest_fy,
     )
 
@@ -143,6 +153,16 @@ def _validate(slots):
     fy_wl = known_fys()
     slots["companies"] = [c for c in slots["companies"] if c in company_wl]
     slots["fys"] = [y for y in slots["fys"] if y in fy_wl]
+    # Canonicalise metrics to valid keys; drop anything off-vocabulary. The LLM
+    # is told to emit keys, but routing each through canonicalize_metric also
+    # rescues a stray alias and guarantees only real metric_keys survive.
+    from facts import canonicalize_metric  # local import: avoid import cycle
+    cleaned = []
+    for m in slots["metrics"]:
+        k = canonicalize_metric(m)
+        if k and k not in cleaned:
+            cleaned.append(k)
+    slots["metrics"] = cleaned
     # All-empty filter slots = nothing actionable; let regex try.
     if not slots["companies"] and not slots["fys"] and not slots["quarters"]:
         return None

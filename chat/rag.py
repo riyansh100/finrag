@@ -81,7 +81,8 @@ def _build_flags(result):
     return flags
 
 
-def run_query(question, history, mode=None, upload_ids=None):
+def run_query(question, history, mode=None, upload_ids=None,
+              skip_generation=False):
     """Call the RAG pipeline and return JSON-able pieces.
 
     history: list of {"role", "content"} for THIS chat, already trimmed and
@@ -91,15 +92,18 @@ def run_query(question, history, mode=None, upload_ids=None):
           temperature/prompt match the mode.
     upload_ids: optional list of UploadedDoc ids attached to this turn. Each
           one's per-upload Chroma collection is searched alongside the corpus.
+    skip_generation: resolve slots + retrieval but skip the answer LLM call
+          (answer comes back None). Used for chart questions, which are
+          answered from MetricFact (SQL), not the LLM.
     Returns: {"answer", "sources", "flags", "mode", "rewritten_query"}.
     """
     upload_ids = list(upload_ids or [])
     if mode:
         result = _ask(question, history=history, mode=mode,
-                      upload_ids=upload_ids)
+                      upload_ids=upload_ids, skip_generation=skip_generation)
     else:
         result = _ask(question, history=history, llm=get_llm(),
-                      upload_ids=upload_ids)
+                      upload_ids=upload_ids, skip_generation=skip_generation)
     return {
         "answer": result["answer"],
         "sources": [_doc_to_dict(d) for d in result["sources"]],

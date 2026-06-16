@@ -158,17 +158,83 @@ def has_chart_intent(question: str) -> bool:
     return bool(_CHART_INTENT_RE.search(question or ""))
 
 
+_PCT_METRICS = {"operating_margin_pct", "pat_margin_pct", "roe_pct"}
+
+
+def _fmt_val(metric: str, v: float) -> str:
+    if metric in _PCT_METRICS:
+        return f"{v:.1f}%"
+    if metric.endswith("_days"):
+        return f"{v:.0f} days"
+    if metric.startswith("eps"):
+        return f"₹{v:.2f}"
+    return f"₹{v:,.0f} cr"
+
+
+def caption_for_chart(chart: dict) -> str:
+    """Deterministic, LLM-free one-paragraph summary of a chart's data, so the
+    text next to a chart is always consistent with it (the RAG/LLM answer reads
+    PDF chunks and can disagree with the SQL series). First → last value with %
+    change per metric, over the charted period span."""
+    periods = chart.get("periods") or []
+    lines = []
+    for s in chart.get("series", []):
+        vals = [(p, v) for p, v in zip(periods, s["values"]) if v is not None]
+        if len(vals) < 2:
+            continue
+        (p0, v0), (p1, v1) = vals[0], vals[-1]
+        metric = s["metric"]
+        delta = ""
+        if metric not in _PCT_METRICS and v0:
+            pct = (v1 - v0) / abs(v0) * 100
+            delta = f" ({'+' if pct >= 0 else ''}{pct:.0f}% over the period)"
+        elif metric in _PCT_METRICS:
+            delta = f" ({v1 - v0:+.1f} pts)"
+        lines.append(f"- **{s['label']}**: {_fmt_val(metric, v0)} ({p0}) → "
+                     f"{_fmt_val(metric, v1)} ({p1}){delta}")
+    if not lines:
+        return f"Charted **{chart['company'].upper()}** below."
+    header = (f"**{chart['company'].upper()}** — {len(periods)} periods "
+              f"({periods[0]}–{periods[-1]}). From the structured financials:")
+    return header + "\n\n" + "\n".join(lines) + \
+        "\n\n*Chart below is rendered directly from the metric store.*"
+
+
+# Aliases tuned for casual CHART phrasing ("plot eps", "graph margins"), which
+# is looser than the statement-extraction vocabulary in facts.CANONICAL_METRICS
+# (that one has no bare "eps", "equity", "assets", or "margins"). Longest alias
+# wins within a metric so "operating margin" beats "operating".
+_CHART_ALIASES = {
+    "revenue":              ["revenue", "topline", "sales"],
+    "operating_profit":     ["operating profit", "ebit"],
+    "pat":                  ["net profit", "profit after tax", "net income", "pat"],
+    "total_assets":         ["total assets", "assets"],
+    "total_equity":         ["total equity", "shareholders equity", "net worth", "equity"],
+    "total_liabilities":    ["total liabilities", "liabilities"],
+    "operating_margin_pct": ["operating margin"],
+    "pat_margin_pct":       ["net margin", "pat margin", "profit margin"],
+    "roe_pct":              ["return on equity", "roe"],
+    "eps_basic":            ["basic eps", "earnings per share", "eps"],
+    "dso_days":             ["dso", "days sales outstanding"],
+    "trade_receivables":    ["trade receivables", "receivables"],
+    "cash_and_equivalents": ["cash and cash equivalents", "cash"],
+}
+_MARGIN_GROUP = ["operating_margin_pct", "pat_margin_pct"]
+
+
 def _metrics_from_text(question: str) -> list[str]:
-    """Canonical metric keys named directly in the question text — a word-boundary
-    scan over the metric aliases. LLM-free, so prompt-charts pick the right
-    metric even when the slot extractor didn't run. Longest aliases first so
-    'operating margin' wins over 'operating profit' when both could match."""
-    import facts as facts_lib
+    """Canonical metric keys named directly in the question text (word-boundary
+    scan over _CHART_ALIASES). LLM-free, so chart prompts resolve the right
+    metric without depending on the slot extractor."""
     q = (question or "").lower()
     found = []
-    for key, aliases in facts_lib.CANONICAL_METRICS.items():
+    # Generic "margin(s)" with no specific qualifier -> both margin lines.
+    if re.search(r"\bmargins?\b", q) and not re.search(
+            r"operating margin|net margin|pat margin|profit margin", q):
+        found.extend(_MARGIN_GROUP)
+    for key, aliases in _CHART_ALIASES.items():
         for alias in sorted(aliases, key=len, reverse=True):
-            if re.search(r"\b" + re.escape(alias.lower()) + r"\b", q):
+            if re.search(r"\b" + re.escape(alias) + r"\b", q):
                 if key not in found:
                     found.append(key)
                 break
@@ -199,10 +265,11 @@ def chart_for_question(question: str, slots: dict | None) -> dict | None:
     company = companies[0]
 
     # Resolve requested metrics -> canonical keys. Priority:
-    #   1. metrics the LLM slot extractor found (when it ran);
-    #   2. metrics named directly in the question text (regex over the metric
-    #      aliases) -- this keeps charts correct even when the LLM is down /
-    #      unauthenticated, which is exactly when slots["metrics"] is empty;
+    #   1. metrics the LLM slot extractor returned — now CONSTRAINED to the
+    #      canonical key vocabulary and validated in nlu._validate, so it gets
+    #      first crack on fuzzy phrasing without the old free-text noise;
+    #   2. the deterministic text scan, as a fallback when the LLM is down /
+    #      returned nothing (closed-vocabulary lookup never fails silently);
     #   3. revenue, as a last-resort default for a bare "chart/trend".
     import facts as facts_lib
     wanted = []
