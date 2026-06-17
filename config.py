@@ -5,6 +5,13 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
+# --- Domain pack ------------------------------------------------------------
+# All corpus-specific knowledge (companies, fiscal calendar, metric vocabulary,
+# units, currency detection, prompt rules) lives in packs/<DOMAIN_PACK>/pack.yaml
+# and is read through domain.get_pack(). Point this at another pack folder to
+# retarget the generic engine at a different domain — no code changes.
+DOMAIN_PACK = "finance-india"
+
 # --- LLM provider -----------------------------------------------------------
 # Which backend builds the chat model. All call sites go through
 # llm_provider.make_chat(), so flipping this is the ONLY change needed to

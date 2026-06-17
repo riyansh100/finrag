@@ -1,143 +1,36 @@
-"""Per-company filename parsers.
+"""Filename -> period metadata, driven by the active domain pack.
 
-Each parser maps `(filename) -> dict` of metadata stamped onto every chunk of
-that document. The ingest pipeline walks `data/<company>/*.pdf` and looks up
-the parser by folder name.
+The per-company filename rules, the company registry, and the fiscal-calendar
+convention all live in packs/<DOMAIN_PACK>/pack.yaml now (see domain.py). This
+module is a thin compatibility layer so the ingest / backfill / nlu / upload
+call sites keep their existing imports.
 
-Metadata schema (all chunks):
-    company   str    canonical company slug ("infosys", "riil", ...)
-    doc_type  str    "quarterly" | "annual"
-    period    str    canonical period label, used by retrieval filters
-                       quarterly -> "Q1FY26"
-                       annual    -> "FY25"
-    quarter   int | None    1..4 for quarterlies, None for annuals
-    fy        int    fiscal year, last two digits (26 means FY26 = Apr 2025 - Mar 2026)
-
-A "fiscal year" follows the Indian convention: FY26 runs Apr 2025 - Mar 2026.
-For Infosys quarterly filenames like `q1-2026.pdf`, the trailing year IS the FY.
+Metadata schema (stamped onto every chunk):
+    company   str          canonical company slug ("infosys", "riil", ...)
+    doc_type  str          "quarterly" | "annual" | "unknown"
+    period    str | None   canonical period label ("Q1FY26", "FY25")
+    quarter   int | None   1..4 for quarterlies, None for annuals
+    fy        int | None   two-digit fiscal year (26 == FY26)
 """
 
-import re
+from domain import get_pack
 
 
-# --- per-company parsers ---------------------------------------------------
-
-_INFOSYS_RE = re.compile(r"^q([1-4])-(\d{4})\.pdf$", re.IGNORECASE)
-
-
-def parse_infosys_quarterly(filename):
-    """`q1-2026.pdf` -> Q1FY26 metadata."""
-    m = _INFOSYS_RE.match(filename)
-    if not m:
-        return None
-    quarter = int(m.group(1))
-    year = int(m.group(2))      # 2026
-    fy = year % 100             # 26
-    return {
-        "company": "infosys",
-        "doc_type": "quarterly",
-        "period": f"Q{quarter}FY{fy:02d}",
-        "quarter": quarter,
-        "fy": fy,
-    }
-
-
-# `Annual-Report-2024-25.pdf` -- FY ends in the second year (Mar 2025 -> FY25).
-_RIIL_ANNUAL_RE = re.compile(
-    r"^annual[-_ ]report[-_ ](\d{4})[-_ ](\d{2,4})\.pdf$", re.IGNORECASE,
-)
-
-
-def parse_riil_annual(filename):
-    m = _RIIL_ANNUAL_RE.match(filename)
-    if not m:
-        return None
-    end_year = int(m.group(2))
-    if end_year < 100:          # "2024-25" -> 25
-        fy = end_year
-    else:                       # "2024-2025" -> 25
-        fy = end_year % 100
-    return {
-        "company": "riil",
-        "doc_type": "annual",
-        "period": f"FY{fy:02d}",
-        "quarter": None,
-        "fy": fy,
-    }
-
-
-# --- registry --------------------------------------------------------------
-
-# Folder name (lowercased) -> list of parsers to try in order.
-PARSERS = {
-    "infosys": [parse_infosys_quarterly],
-    "riil":    [parse_riil_annual],
-}
-
-
-# --- generic detector for on-the-fly uploads -------------------------------
-#
-# Uploads aren't filed into a `data/<company>/` folder, so PARSERS can't
-# resolve them. We still WANT to stamp a period on the chunks so the LLM
-# doesn't hallucinate fiscal years from raw page text. This best-effort
-# detector tries the same patterns we already support and returns whatever
-# matches (company may be left blank — we only commit to a period).
+# Backwards-compatible registry: {slug: [parser specs]}. Consumers only rely on
+# `.keys()`, `in`, and `.items()` (to enumerate known companies), all of which
+# this dict supports.
+PARSERS = {slug: get_pack().parsers_for(slug) for slug in get_pack().company_slugs()}
 
 
 def detect_upload_meta(filename: str) -> dict:
-    """Return a best-effort metadata dict for an ad-hoc upload filename.
-
-    Currently understands:
-      - `q1-2018.pdf` style                -> period=Q1FY18 (Indian FY convention)
-      - `Annual-Report-2024-25.pdf` style  -> period=FY25
-
-    Anything else returns an empty stub (no period stamp). Never raises.
-    """
-    name = (filename or "").strip()
-    # Infosys-style quarterly
-    m = _INFOSYS_RE.match(name)
-    if m:
-        quarter = int(m.group(1))
-        fy = int(m.group(2)) % 100
-        return {
-            "doc_type": "quarterly",
-            "period":   f"Q{quarter}FY{fy:02d}",
-            "quarter":  quarter,
-            "fy":       fy,
-        }
-    # Annual-report-style
-    m = _RIIL_ANNUAL_RE.match(name)
-    if m:
-        end_year = int(m.group(2))
-        fy = end_year if end_year < 100 else end_year % 100
-        return {
-            "doc_type": "annual",
-            "period":   f"FY{fy:02d}",
-            "quarter":  None,
-            "fy":       fy,
-        }
-    return {}
+    """Best-effort metadata for an ad-hoc upload filename (no company folder).
+    Returns a period stub without a company tag, or {} if nothing matches."""
+    return get_pack().detect_upload_meta(filename)
 
 
 def parse_filename(company_folder, filename):
     """Look up the company's parsers and return metadata, or None on no match.
 
     Falls back to a permissive {"company": <folder>} stub so an unrecognised
-    filename in a known folder still gets the company tag (and we can debug it
-    from the ingest log).
-    """
-    parsers = PARSERS.get(company_folder.lower(), [])
-    for fn in parsers:
-        meta = fn(filename)
-        if meta is not None:
-            return meta
-    # Unknown filename shape inside a known company folder.
-    if company_folder.lower() in PARSERS:
-        return {
-            "company": company_folder.lower(),
-            "doc_type": "unknown",
-            "period": None,
-            "quarter": None,
-            "fy": None,
-        }
-    return None
+    filename in a known folder still gets the company tag."""
+    return get_pack().parse_filename(company_folder, filename)

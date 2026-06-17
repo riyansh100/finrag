@@ -19,6 +19,7 @@ from langchain_classic.retrievers.ensemble import EnsembleRetriever
 
 import config
 import llm_provider
+from domain import get_pack
 import verify as answer_verify
 from ingest import author_from_filename
 from embeddings import make_vectorstore
@@ -254,37 +255,13 @@ def detect_source_filter(question, *extra_questions):
 
 # --- company / period intent (financial corpora) ----------------------------
 
-# Token (lowercase, alpha-only) -> canonical company slug stored in metadata.
-# Aliases let "reliance", "riil", "rel industrial" all resolve to "riil".
-# Multi-word aliases are matched as substrings on the full question text.
-_COMPANY_TOKEN_ALIASES = {
-    "infosys": "infosys",
-    "infy": "infosys",
-    "riil": "riil",
-    "reliance": "riil",
-}
-_COMPANY_PHRASE_ALIASES = [
-    ("reliance industrial infrastructure", "riil"),
-    ("reliance industrial", "riil"),
-    ("rel industrial", "riil"),
-    ("reliance infra", "riil"),
-]
+# Company aliases (token + phrase), fiscal calendar, and currency markers all
+# come from the active domain pack (packs/<DOMAIN_PACK>/pack.yaml).
 
 
 def detect_all_companies(*questions):
     """Return the set of company slugs mentioned in any of the question strings."""
-    matched = set()
-    for q in questions:
-        if not q:
-            continue
-        ql = q.lower()
-        for phrase, slug in _COMPANY_PHRASE_ALIASES:
-            if phrase in ql:
-                matched.add(slug)
-        for t in re.findall(r"[a-z]+", ql):
-            if t in _COMPANY_TOKEN_ALIASES:
-                matched.add(_COMPANY_TOKEN_ALIASES[t])
-    return matched
+    return get_pack().detect_companies(*questions)
 
 
 def detect_company_filter(question, *extra_questions):
@@ -516,7 +493,7 @@ _TYPO_FIXES = [
 # token; everything before the LAST such marker is reasoning leakage.
 _SCRATCH_HEAD_RE = re.compile(
     r"(?ims)^(?:.*?)(^(?:#{1,6}\s+\S|(?:framing|headline|summary|answer|result|"
-    r"comparison|overview|response|infosys\b|the\b)\b))",
+    r"comparison|overview|response|" + get_pack().alias_regex() + r"|the\b)\b))",
 )
 _SCRATCH_PHRASES = (
     "we should produce", "we need to", "let's craft", "let me",
@@ -727,12 +704,11 @@ def _dedupe(docs):
 # final list INR-first, so the MAX_CONTEXT_CHUNKS cap demotes USD pages first.
 # This keeps the USD content available when it's the only thing that matched,
 # but never lets it crowd out the INR version of the same statement.
-_USD_MARKERS = ("in us $", "in us$", "us$ millions", "us $ millions",
-                "(in usd", "(in us $", "(in us$",
-                "statement of comprehensive income\n(in us")
-_INR_MARKERS = ("in ₹ crore", "in ` crore", "in rs. crore", "in rs crore",
-                "(in ₹", "(in `", "₹ crore", "rs. crore",
-                "(in inr")
+_CURRENCY_DETECTION = get_pack().currency_detection
+_INR_MARKERS = tuple(_CURRENCY_DETECTION.get("variants", {})
+                     .get("inr", {}).get("markers", []))
+_USD_MARKERS = tuple(_CURRENCY_DETECTION.get("variants", {})
+                     .get("usd", {}).get("markers", []))
 
 
 _USD_PER_SHARE_RE = re.compile(r"\beps\s*\(\$\)", re.IGNORECASE)
@@ -749,8 +725,10 @@ _DOLLAR_VALUE_RE = re.compile(r"\$\s?\d")
 # The regex accepts both Western grouping ("145,452") and Indian grouping
 # ("1,45,452") which is how PyMuPDF tends to render Infosys' rupee tables.
 _LARGE_NUMBER_RE = re.compile(r"\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b|\b\d{5,}\b")
-_INR_MAGNITUDE_THRESHOLD = 50_000
-_USD_MAGNITUDE_CEILING = 5_000
+_INR_MAGNITUDE_THRESHOLD = _CURRENCY_DETECTION.get("variants", {}) \
+    .get("inr", {}).get("magnitude_min", 50_000)
+_USD_MAGNITUDE_CEILING = _CURRENCY_DETECTION.get("variants", {}) \
+    .get("usd", {}).get("magnitude_max", 5_000)
 
 
 def _max_numeric_value(text):
@@ -1202,7 +1180,7 @@ _PRONOUN_RE = re.compile(
 )
 _ENTITY_HINT_RE = re.compile(
     r"\bfy\s*\d{2,4}\b|\bq[1-4]\b|\b(?:19|20)\d{2}\b|"
-    r"\b(?:infosys|infy|riil|reliance)\b",
+    r"\b(?:" + get_pack().alias_regex() + r")\b",
     re.IGNORECASE,
 )
 

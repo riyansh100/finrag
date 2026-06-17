@@ -22,88 +22,28 @@ from typing import Iterable
 from langchain_ollama import ChatOllama
 
 import config
+from domain import get_pack
 
 
 # ---------------------------------------------------------------------------
-# Canonical metric vocabulary.
-#
-# The extractor LLM is told to use these keys directly. As a safety net we
-# also build a reverse lookup so free-text metric names ("topline",
-# "operating margin") still resolve. Extending the vocabulary = adding one
-# entry; no schema change.
+# Canonical metric & unit vocabulary — sourced from the active domain pack
+# (packs/<DOMAIN_PACK>/pack.yaml). The extractor LLM is told to use the
+# canonical keys directly; the reverse lookups rescue free-text names
+# ("topline", "₹ crore"). Extending the vocabulary = editing the pack, no code.
 # ---------------------------------------------------------------------------
 
-CANONICAL_METRICS: dict[str, list[str]] = {
-    # P&L
-    "revenue":               ["revenue", "revenues", "revenue from operations",
-                              "topline", "total revenue", "net revenue",
-                              "total income"],
-    "cost_of_sales":         ["cost of sales", "cost of goods sold", "cogs",
-                              "cost of revenue"],
-    "gross_profit":          ["gross profit"],
-    "selling_marketing_exp": ["selling and marketing expenses",
-                              "selling marketing expenses"],
-    "general_admin_exp":     ["general and administration expenses",
-                              "general and administrative expenses",
-                              "g&a expenses", "admin expenses"],
-    "total_operating_exp":   ["total operating expenses"],
-    "operating_profit":      ["operating profit", "ebit", "operating income"],
-    "operating_margin_pct":  ["operating margin", "op margin",
-                              "operating profit margin"],
-    "other_income":          ["other income"],
-    "pbt":                   ["profit before tax", "pbt",
-                              "profit before income taxes"],
-    "tax":                   ["tax", "income tax expense", "tax expense"],
-    "pat":                   ["profit after tax", "pat", "net profit",
-                              "net income", "profit for the year",
-                              "profit for the period"],
-    "pat_margin_pct":        ["pat margin", "net margin", "net profit margin"],
-    "eps_basic":             ["basic eps", "basic earnings per share"],
-    "eps_diluted":           ["diluted eps", "diluted earnings per share"],
+# Module-level alias kept for back-compat with importers (nlu, cache, dashboard).
+CANONICAL_METRICS: dict[str, list[str]] = get_pack().canonical_metrics()
 
-    # Balance sheet
-    "total_assets":          ["total assets"],
-    "total_equity":          ["total equity", "total shareholders equity",
-                              "net worth", "shareholders funds"],
-    "total_liabilities":     ["total liabilities"],
-    "cash_and_equivalents":  ["cash and cash equivalents",
-                              "cash and bank balances"],
-    "current_investments":   ["current investments"],
-    "non_current_investments": ["non current investments",
-                                "non-current investments"],
-    "trade_receivables":     ["trade receivables", "accounts receivable",
-                              "debtors"],
-    "ppe":                   ["property, plant and equipment", "ppe",
-                              "fixed assets"],
+_METRIC_LOOKUP = get_pack().metric_lookup()
+_UNIT_LOOKUP = get_pack().unit_lookup()
 
-    # Cash flow
-    "cash_from_operations":  ["cash flow from operating activities",
-                              "operating cash flow", "ocf",
-                              "net cash from operating activities"],
-    "cash_from_investing":   ["cash flow from investing activities",
-                              "net cash from investing activities"],
-    "cash_from_financing":   ["cash flow from financing activities",
-                              "net cash from financing activities"],
-
-    # Operational
-    "headcount":             ["headcount", "employees", "employee count",
-                              "total employees"],
-    "dso_days":              ["dso", "day's sales outstanding",
-                              "days sales outstanding"],
-    "roe_pct":               ["roe", "return on equity"],
-}
-
-
-def _build_metric_lookup():
-    rev = {}
-    for canonical, aliases in CANONICAL_METRICS.items():
-        rev[canonical.lower()] = canonical
-        for alias in aliases:
-            rev[alias.lower()] = canonical
-    return rev
-
-
-_METRIC_LOOKUP = _build_metric_lookup()
+# Tail tokens (units/currencies) stripped before a tolerant metric re-lookup.
+_METRIC_TAIL_RE = re.compile(
+    r"\s*(\(.*\)|%|"
+    + "|".join(re.escape(t) for t in get_pack().metric_tail_noise)
+    + r")\.?\s*$"
+)
 
 
 def canonicalize_metric(raw: str) -> str | None:
@@ -115,40 +55,10 @@ def canonicalize_metric(raw: str) -> str | None:
     if key in _METRIC_LOOKUP:
         return _METRIC_LOOKUP[key]
     # Tolerant: strip trailing "%" / units the model may append.
-    key2 = re.sub(r"\s*(\(.*\)|%|crore|cr|lakh|million|m|usd|inr|rs\.?)\s*$",
-                  "", key).strip()
+    key2 = _METRIC_TAIL_RE.sub("", key).strip()
     if key2 in _METRIC_LOOKUP:
         return _METRIC_LOOKUP[key2]
     return None
-
-
-# ---------------------------------------------------------------------------
-# Unit normalisation. Maps free-text units the LLM might emit to our
-# controlled vocabulary (see chat.models.UNIT_CHOICES).
-# ---------------------------------------------------------------------------
-
-_UNIT_LOOKUP = {
-    # INR crore family
-    "inr_crore": "inr_crore", "crore": "inr_crore", "cr": "inr_crore",
-    "crores": "inr_crore", "₹ crore": "inr_crore", "rs crore": "inr_crore",
-    "rs. crore": "inr_crore", "₹crore": "inr_crore",
-    # INR lakh
-    "inr_lakh": "inr_lakh", "lakh": "inr_lakh", "lakhs": "inr_lakh",
-    "₹ lakh": "inr_lakh",
-    # USD million
-    "usd_million": "usd_million", "us$ million": "usd_million",
-    "us$ millions": "usd_million", "usd million": "usd_million",
-    "$ million": "usd_million", "$m": "usd_million", "million usd": "usd_million",
-    # Bare currencies (last resort)
-    "inr": "inr", "rs": "inr", "rs.": "inr", "₹": "inr",
-    "usd": "usd", "$": "usd",
-    # Per-share / percent / count
-    "pct": "pct", "%": "pct", "percent": "pct", "percentage": "pct",
-    "rupees": "rupees", "₹/share": "rupees", "rs per share": "rupees",
-    "count": "count", "people": "count", "employees": "count",
-    "ratio": "ratio", "x": "ratio", "times": "ratio",
-    "days": "days",
-}
 
 
 def canonicalize_unit(raw: str) -> str | None:

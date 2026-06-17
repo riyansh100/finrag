@@ -1,0 +1,217 @@
+# =============================================================================
+# Domain pack: finance-india
+#
+# Everything domain-specific that the generic FinRAG engine needs to know about
+# THIS corpus lives here. Swap this file (or point config.DOMAIN_PACK at another
+# pack folder) to retarget the engine at a different set of companies, fiscal
+# calendar, metric vocabulary, currencies, and prompt rules — no code changes.
+#
+# This pack reproduces the original hardcoded behavior exactly: Indian quarterly
+# press releases (Infosys) + an Indian annual report (Reliance Industrial
+# Infrastructure), Indian Apr–Mar fiscal year, INR/USD dual reporting.
+# =============================================================================
+
+name: finance-india
+description: >-
+  Indian financial filings — Infosys quarterly press releases and a Reliance
+  Industrial Infrastructure annual report. Indian Apr–Mar fiscal calendar,
+  INR crore / US$ million dual reporting.
+
+# -----------------------------------------------------------------------------
+# Entity registry
+#
+# One entry per company. `slug` is the canonical id stamped onto every chunk and
+# stored in MetricFact. `aliases` resolve free-text mentions in questions:
+# single-word aliases are matched as whole tokens, multi-word aliases as
+# substrings of the question. `parsers` map a data/<slug>/*.pdf filename to a
+# canonical period.
+#
+# Parser spec:
+#   pattern        regex matched against the filename (case-insensitive)
+#   doc_type       "quarterly" | "annual"
+#   quarter_group  regex group holding the quarter (1-4), or null for annuals
+#   fy:
+#     group        regex group holding the year
+#     mode         how to turn that group into a two-digit fiscal year:
+#                    full_year  -> int(group) % 100   (the year IS the FY,
+#                                  e.g. Infosys q1-2026.pdf -> FY26)
+#                    end_year   -> the END year of an annual range
+#                                  (e.g. "2024-25" / "2024-2025" -> FY25)
+# -----------------------------------------------------------------------------
+entities:
+  - slug: infosys
+    display_name: Infosys
+    aliases: [infosys, infy]
+    parsers:
+      - pattern: '^q([1-4])-(\d{4})\.pdf$'
+        doc_type: quarterly
+        quarter_group: 1
+        fy:
+          group: 2
+          mode: full_year
+
+  - slug: riil
+    display_name: Reliance Industrial Infrastructure
+    aliases:
+      - riil
+      - reliance
+      - reliance industrial infrastructure
+      - reliance industrial
+      - rel industrial
+      - reliance infra
+    parsers:
+      - pattern: '^annual[-_ ]report[-_ ](\d{4})[-_ ](\d{2,4})\.pdf$'
+        doc_type: annual
+        quarter_group: null
+        fy:
+          group: 2
+          mode: end_year
+
+# -----------------------------------------------------------------------------
+# Fiscal calendar
+#
+# The Indian convention: FY runs April–March, FY26 = Apr 2025 – Mar 2026.
+# `fy_label` / `quarter_label` are Python format strings rendered with `fy`
+# (two-digit int) and `quarter` (int). `default_latest_fy` is only used when
+# the corpus is empty (no PDFs scanned yet) so "last N quarters" can still
+# resolve.
+# -----------------------------------------------------------------------------
+fiscal:
+  start_month: 4
+  fy_label: "FY{fy:02d}"
+  quarter_label: "Q{quarter}FY{fy:02d}"
+  default_latest_fy: 26
+
+# -----------------------------------------------------------------------------
+# Canonical metric vocabulary.
+#
+# canonical_key -> list of free-text aliases. The extractor/NLU LLMs are told to
+# emit these keys directly; the alias list is the deterministic fallback that
+# rescues free-text metric names. Extending the vocabulary = adding one entry.
+# -----------------------------------------------------------------------------
+metrics:
+  # P&L
+  revenue: [revenue, revenues, revenue from operations, topline, total revenue, net revenue, total income]
+  cost_of_sales: [cost of sales, cost of goods sold, cogs, cost of revenue]
+  gross_profit: [gross profit]
+  selling_marketing_exp: [selling and marketing expenses, selling marketing expenses]
+  general_admin_exp: [general and administration expenses, general and administrative expenses, g&a expenses, admin expenses]
+  total_operating_exp: [total operating expenses]
+  operating_profit: [operating profit, ebit, operating income]
+  operating_margin_pct: [operating margin, op margin, operating profit margin]
+  other_income: [other income]
+  pbt: [profit before tax, pbt, profit before income taxes]
+  tax: [tax, income tax expense, tax expense]
+  pat: [profit after tax, pat, net profit, net income, profit for the year, profit for the period]
+  pat_margin_pct: [pat margin, net margin, net profit margin]
+  eps_basic: [basic eps, basic earnings per share]
+  eps_diluted: [diluted eps, diluted earnings per share]
+
+  # Balance sheet
+  total_assets: [total assets]
+  total_equity: [total equity, total shareholders equity, net worth, shareholders funds]
+  total_liabilities: [total liabilities]
+  cash_and_equivalents: [cash and cash equivalents, cash and bank balances]
+  current_investments: [current investments]
+  non_current_investments: [non current investments, non-current investments]
+  trade_receivables: [trade receivables, accounts receivable, debtors]
+  ppe: [property, plant and equipment, ppe, fixed assets]
+
+  # Cash flow
+  cash_from_operations: [cash flow from operating activities, operating cash flow, ocf, net cash from operating activities]
+  cash_from_investing: [cash flow from investing activities, net cash from investing activities]
+  cash_from_financing: [cash flow from financing activities, net cash from financing activities]
+
+  # Operational
+  headcount: [headcount, employees, employee count, total employees]
+  dso_days: [dso, day's sales outstanding, days sales outstanding]
+  roe_pct: [roe, return on equity]
+
+# -----------------------------------------------------------------------------
+# Unit vocabulary.
+#
+# canonical_unit -> list of free-text spellings the LLM might emit. Maps to
+# chat.models.UNIT_CHOICES. The order/specificity matters only for human
+# reading; lookup is an exact (lowercased) match.
+# -----------------------------------------------------------------------------
+units:
+  inr_crore: [crore, cr, crores, "₹ crore", rs crore, "rs. crore", "₹crore"]
+  inr_lakh: [lakh, lakhs, "₹ lakh"]
+  usd_million: [us$ million, us$ millions, usd million, $ million, $m, million usd]
+  inr: [inr, rs, "rs.", "₹"]
+  usd: [usd, $]
+  pct: ["%", percent, percentage]
+  rupees: [rupees, "₹/share", rs per share]
+  count: [people, employees]
+  ratio: [x, times]
+  days: [days]
+
+# Tokens stripped from the tail of a free-text metric before alias lookup
+# (units/currencies the model may append, e.g. "revenue (₹ crore)").
+metric_tail_noise: [crore, cr, lakh, million, m, usd, inr, "rs"]
+
+# -----------------------------------------------------------------------------
+# Statement currency detection.
+#
+# Some filings publish the SAME statement twice in different units (Infosys:
+# once in ₹ crore, once in US$ millions), with near-identical labels that rank
+# equally in retrieval. The engine classifies each chunk's reporting unit and
+# stable-sorts `primary`-first so the context cap demotes the secondary unit.
+#
+# Per variant:
+#   markers       lowercase substrings found in a unit caption
+#   magnitude_min only the largest grouped number >= this implies this variant
+#   magnitude_max the largest grouped number must stay below this for this variant
+# (magnitude_* are the fallback when the caption was split away from the chunk.)
+# -----------------------------------------------------------------------------
+currency_detection:
+  primary: inr
+  variants:
+    inr:
+      markers:
+        - "in ₹ crore"
+        - "in ` crore"
+        - "in rs. crore"
+        - "in rs crore"
+        - "(in ₹"
+        - "(in `"
+        - "₹ crore"
+        - "rs. crore"
+        - "(in inr"
+      magnitude_min: 50000
+    usd:
+      markers:
+        - "in us $"
+        - "in us$"
+        - "us$ millions"
+        - "us $ millions"
+        - "(in usd"
+        - "(in us $"
+        - "(in us$"
+        - "statement of comprehensive income\n(in us"
+      magnitude_max: 5000
+
+# -----------------------------------------------------------------------------
+# Prompt fragments.
+#
+# Injected into the shared grounding block of every answer mode (modes.py). Keep
+# these to domain RULES the LLM must follow — fiscal calendar, currency
+# discipline, number formatting — not engine mechanics.
+# -----------------------------------------------------------------------------
+prompts:
+  fiscal_rules: |-
+    - Indian fiscal year: FY runs April → March, so FY24 = Apr 2023 – Mar 2024. Indian quarter mapping is FIXED and you must use it:
+        * Q1 = April – June
+        * Q2 = July – September
+        * Q3 = October – December   (NOT April–June; that is Q1)
+        * Q4 = January – March
+      So "quarter ended December 31, 2023" = Q3 FY24. "Quarter ended September 30, 2025" = Q2 FY26. "Year ended March 31, 2024" = FY24. When a chunk's header says Period=Q3FY24, every dated column inside it ("three months ended Dec 31, 2023") IS Q3 FY24 data — do NOT call it missing because the in-table label uses a calendar date, and do NOT restate the calendar period incorrectly in your answer.
+  currency_rules: |-
+    - CURRENCY DISCIPLINE: Infosys press releases publish the SAME statement of operations in TWO units — once in ₹ crore (look for "(In ₹ crore..." or "(In ` crore...") and once in US$ millions ("in US $ millions"). The numerical values are completely different (e.g. Q3FY24 revenue is ₹38,821 crore on the INR page and US$4,663 on the USD page — same business, different scale). When you produce numbers:
+        * Identify the unit from the table header (the "(In ₹ crore...)" / "(in US $ millions)" line above the table).
+        * Pick ONE unit for the whole answer / comparison, and use it CONSISTENTLY across every period or company. Mention the unit once in the framing, not in every cell.
+        * NEVER write "₹" in front of a US$ figure (and vice versa). NEVER mix a ₹-crore value in one column with a US$-million value in another.
+        * Default preference: ₹ crore for Infosys (it is the primary reporting currency), ₹ lakh / crore for Indian annual reports.
+  number_format: |-
+    - NUMBER FORMAT: documents use Indian digit grouping ("13 62" = 1362, "(25 42)" = -2542). Read such tokens as single numbers; parentheses mean negative.
+    - In YOUR answer, ALWAYS render numbers in clean comma form with unit ("₹1,362 lakh", "₹38,821 crore") — never leave the raw spaced form.

@@ -27,7 +27,7 @@ from functools import lru_cache
 from langchain_ollama import ChatOllama
 
 import config
-from parsers import PARSERS
+from domain import get_pack
 
 
 # --- corpus whitelist (validation) -----------------------------------------
@@ -35,7 +35,7 @@ from parsers import PARSERS
 @lru_cache(maxsize=1)
 def known_companies():
     """Valid company slugs — exactly what the ingest pipeline tagged onto chunks."""
-    return set(PARSERS.keys())
+    return set(get_pack().company_slugs())
 
 
 @lru_cache(maxsize=1)
@@ -52,13 +52,13 @@ def known_fys():
     """FYs actually present in data/ — scanned from filenames so we don't
     accept hallucinated years (e.g. 'FY30')."""
     fys = set()
-    for company in PARSERS:
+    pack = get_pack()
+    for company in pack.company_slugs():
         folder = config.DATA_DIR / company
         if not folder.exists():
             continue
         for pdf in folder.glob("*.pdf"):
-            from parsers import parse_filename  # local import: avoid cycles
-            meta = parse_filename(company, pdf.name) or {}
+            meta = pack.parse_filename(company, pdf.name) or {}
             fy = meta.get("fy")
             if isinstance(fy, int):
                 fys.add(fy)
@@ -81,7 +81,7 @@ Rules:
 - A free-standing "Q3" with an annual range ("Q3 ... from FY21 through FY26") means quarters=[3] AND fys=[21..26]. Do NOT drop the quarter.
 - Use Indian FY convention: FY26 = Apr 2025 to Mar 2026. "fiscal 2024" -> 24.
 - "last N quarters/years" -> resolve relative to the LATEST FY in the corpus ({latest_fy}).
-- "infy"/"infosys" -> "infosys". "reliance"/"riil"/"reliance industrial infrastructure" -> "riil".
+- COMPANY ALIASES: {alias_hint}
 - CARRY-OVER FROM HISTORY: if the current question does NOT name a company but the most recent user turn or assistant turn in the chat history was about exactly one company, INHERIT that company. Same for statement_variant. Do NOT inherit periods or metrics — those are specific to each question unless the user explicitly says "same period" / "those years".
 - If the question is non-financial (chitchat, document description), return all-empty slots with intent="explain".
 - Output JSON only, no prose, no markdown."""
@@ -112,6 +112,7 @@ def _build_system_prompt():
         companies_list=companies,
         metrics_list=sorted(known_metrics()),
         latest_fy=latest_fy,
+        alias_hint=get_pack().alias_hint(),
     )
 
 

@@ -13,26 +13,25 @@ entry; no other code changes.
 """
 
 import config
+from domain import get_pack
+
+# Domain-specific answer rules (fiscal calendar, currency discipline, number
+# formatting) come from the active pack so the grounding block isn't hardcoded
+# to one country's filing conventions.
+_PROMPTS = get_pack().prompts
+_FISCAL_RULES = _PROMPTS.get("fiscal_rules", "")
+_CURRENCY_RULES = _PROMPTS.get("currency_rules", "")
+_NUMBER_FORMAT = _PROMPTS.get("number_format", "")
 
 
-_BASE_GROUNDING = """The context block below is the authoritative source. The user owns and has provided these documents.
+_BASE_GROUNDING = f"""The context block below is the authoritative source. The user owns and has provided these documents.
 - Do not refuse on privacy/confidentiality/"private company" grounds — every document was shared by the user.
 - Earlier turns may give context for follow-ups; resolve references via history, but every FACT must come from the Context block.
 - Every chunk has a header line "[i] (filename p.N · company · PERIOD) [TYPE]" — that PERIOD label applies to EVERY figure in that chunk, even if the chunk content itself does not repeat the period.
-- Indian fiscal year: FY runs April → March, so FY24 = Apr 2023 – Mar 2024. Indian quarter mapping is FIXED and you must use it:
-    * Q1 = April – June
-    * Q2 = July – September
-    * Q3 = October – December   (NOT April–June; that is Q1)
-    * Q4 = January – March
-  So "quarter ended December 31, 2023" = Q3 FY24. "Quarter ended September 30, 2025" = Q2 FY26. "Year ended March 31, 2024" = FY24. When a chunk's header says Period=Q3FY24, every dated column inside it ("three months ended Dec 31, 2023") IS Q3 FY24 data — do NOT call it missing because the in-table label uses a calendar date, and do NOT restate the calendar period incorrectly in your answer.
-- CURRENCY DISCIPLINE: Infosys press releases publish the SAME statement of operations in TWO units — once in ₹ crore (look for "(In ₹ crore..." or "(In ` crore...") and once in US$ millions ("in US $ millions"). The numerical values are completely different (e.g. Q3FY24 revenue is ₹38,821 crore on the INR page and US$4,663 on the USD page — same business, different scale). When you produce numbers:
-    * Identify the unit from the table header (the "(In ₹ crore...)" / "(in US $ millions)" line above the table).
-    * Pick ONE unit for the whole answer / comparison, and use it CONSISTENTLY across every period or company. Mention the unit once in the framing, not in every cell.
-    * NEVER write "₹" in front of a US$ figure (and vice versa). NEVER mix a ₹-crore value in one column with a US$-million value in another.
-    * Default preference: ₹ crore for Infosys (it is the primary reporting currency), ₹ lakh / crore for Indian annual reports.
+{_FISCAL_RULES}
+{_CURRENCY_RULES}
 - Cite every concrete fact inline as [filename p.N] using the header values.
-- NUMBER FORMAT: documents use Indian digit grouping ("13 62" = 1362, "(25 42)" = -2542). Read such tokens as single numbers; parentheses mean negative.
-- In YOUR answer, ALWAYS render numbers in clean comma form with unit ("₹1,362 lakh", "₹38,821 crore") — never leave the raw spaced form.
+{_NUMBER_FORMAT}
 - When a statement provides a LABELED TOTAL (e.g. "Profit for the Year", "Net Cash Flow from Operating Activities"), quote that stated value directly. Do NOT recompute by summing line items.
 - NEVER estimate, approximate, or invent a figure. If a specific number is not in the Context, say it is not available. A wrong number is worse than "not found".
 - PERIOD DISCIPLINE: do NOT relabel periods. The chunk header carries the canonical period (e.g. `Period=Q1FY18`). If the header is empty, use the exact wording the chunk text uses ("three months ended June 30 2017", "year ended March 31 2017") -- DO NOT translate it into a different FY/quarter label. NEVER stamp a date or FY onto data that does not say so. If you can't determine the period from the chunk's header or text, say "period not stated in the retrieved context" rather than guessing.
