@@ -1,7 +1,20 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 BASE_DIR = Path(__file__).resolve().parent
+
+# Load a local .env (if present) so the knobs below can be set without editing
+# code. Real shell env vars take precedence over .env. See .env.example.
+load_dotenv(BASE_DIR / ".env")
+
+
+def _env_bool(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 DATA_DIR = BASE_DIR / "data"
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 
@@ -10,24 +23,24 @@ VECTORSTORE_DIR = BASE_DIR / "vectorstore"
 # units, currency detection, prompt rules) lives in packs/<DOMAIN_PACK>/pack.yaml
 # and is read through domain.get_pack(). Point this at another pack folder to
 # retarget the generic engine at a different domain — no code changes.
-DOMAIN_PACK = "finance-india"
+DOMAIN_PACK = os.environ.get("DOMAIN_PACK", "finance-india")
 
 # --- LLM provider -----------------------------------------------------------
 # Which backend builds the chat model. All call sites go through
 # llm_provider.make_chat(), so flipping this is the ONLY change needed to
 # switch providers. "openrouter" | "ollama".
-LLM_PROVIDER = "openrouter"
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openrouter")
 
 # OpenRouter (OpenAI-compatible). The API key MUST come from the environment —
 # never hardcode it in the repo:
 #     export OPENROUTER_API_KEY="sk-or-v1-..."
 # Pick any chat/instruct model; verify the exact slug on openrouter.ai/models.
 OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL    = "nvidia/nemotron-3-super-120b-a12b:free"
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL    = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 
 # Ollama model (used when LLM_PROVIDER == "ollama").
-LLM_MODEL = "minimax-m3:cloud"
+LLM_MODEL = os.environ.get("OLLAMA_MODEL", "minimax-m3:cloud")
 # Hard ceiling on a single LLM call. Cloud Ollama occasionally accepts a
 # request and then stops streaming -- without this, the chat UI just blinks
 # forever. Anything over this triggers the friendly "model unreachable"
@@ -49,7 +62,7 @@ VISION_TIMEOUT_SEC = 120                # kill vision call if it takes longer th
 
 # Conversational memory
 HISTORY_TURNS = 6                       # last N *messages* sent to LLM (6 = 3 Q&A pairs)
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -91,7 +104,7 @@ RERANKER_FETCH_K = 50        # candidates passed to the reranker per retrieve()
 # Analytics layer (Slice 2) -- MetricFact cache + Redis L1.
 # Redis is OPTIONAL. If unreachable the cache transparently falls back to
 # SQLite (chat.MetricFact). Set REDIS_URL="" to disable Redis entirely.
-REDIS_URL = "redis://localhost:6379/0"
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 FACT_CACHE_TTL_SEC = 24 * 60 * 60   # 24h; PDFs don't change often
 FACT_CACHE_ENABLED = True
 # When the cache covers EVERY requested (company, period, metric) cell, skip

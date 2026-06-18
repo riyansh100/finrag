@@ -8,3 +8,6 @@ db.sqlite3
 
 # Generated fact-extraction cache (backfill.py)
 backfill_cache/
+
+# Local secrets (never commit) — see .env.example
+.env
