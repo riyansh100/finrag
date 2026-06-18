@@ -630,10 +630,11 @@ async function sendQuestion(question) {
   try {
     const res = await postMessage(activeChatId, question, mode, uploadIds);
     pending.remove();
-    // Recall first (above the new answer) so the user sees "we have prior
-    // work on this" before the new answer they're about to read.
-    const recallPanel = renderRecallPanel(res.recall, question);
-    if (recallPanel) $("#messages").appendChild(recallPanel);
+    // Recall panel ("↺ Related past analysis") disabled — noisy in the UI and
+    // the matches weren't adding much. Backend still records AnalysisNotes;
+    // re-enable by uncommenting the two lines below.
+    // const recallPanel = renderRecallPanel(res.recall, question);
+    // if (recallPanel) $("#messages").appendChild(recallPanel);
     const msgNode = addMessage(res.assistant_message);
     // Self-verify badge: figures traced to sources, or flagged as unverified.
     const verifyBadge = renderVerifyBadge(res.verification);

@@ -204,7 +204,7 @@ def slots_to_periods(slots):
     """Cross quarters × fys into canonical period labels the retriever filters on.
 
       quarters=[3], fys=[21,22,23] -> {"Q3FY21","Q3FY22","Q3FY23"}
-      quarters=[],  fys=[24,25]    -> {"FY24","FY25"}
+      quarters=[],  fys=[24,25]    -> {"FY24","FY25}
       quarters=[3], fys=[]         -> set()  (no period filter; quarter alone
                                               isn't a valid Chroma filter
                                               under our metadata schema)
