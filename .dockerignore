@@ -1,0 +1,35 @@
+# Keep the build context small and the image clean. The 1.8GB .venv alone would
+# otherwise be shipped to the daemon on every build.
+
+# Local virtualenv — the image installs its own deps.
+.venv/
+
+# Python bytecode.
+__pycache__/
+*.pyc
+
+# Version control + OS cruft.
+.git/
+.gitignore
+.DS_Store
+
+# Secrets — injected at runtime via env_file / -e, never baked into the image.
+.env
+
+# Generated / runtime state. Mounted as volumes at runtime (see docker-compose),
+# not baked into the image so it stays reproducible and small.
+db.sqlite3
+vectorstore/
+uploads/
+backfill_cache/
+data/*.pdf
+
+# Dev-only: docs, evals, the legacy Streamlit UI.
+*.md
+evals/
+app.py
+
+# Docker files themselves.
+Dockerfile
+.dockerignore
+docker-compose.yml

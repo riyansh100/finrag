@@ -1,0 +1,40 @@
+# One command to run FinRAG with its Redis cache:
+#
+#   cp .env.example .env   # fill in OPENROUTER_API_KEY + DJANGO_SECRET_KEY
+#   docker compose up --build
+#
+# Then open http://localhost:8000
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    # Pull config from your .env (API keys, domain pack, Django settings).
+    env_file: .env
+    environment:
+      # Override the localhost defaults from .env so the container reaches
+      # sibling services and the host:
+      #   - Redis is the `redis` service below, not localhost.
+      REDIS_URL: redis://redis:6379/0
+      #   - If LLM_PROVIDER=ollama, reach Ollama running on the host machine.
+      #     (Harmless when LLM_PROVIDER=openrouter.)
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    volumes:
+      # Persist runtime state across container rebuilds (these are .dockerignored
+      # out of the image on purpose).
+      - ./db.sqlite3:/app/db.sqlite3
+      - ./vectorstore:/app/vectorstore
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    # Persist the cache to a named volume so it survives restarts.
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:
