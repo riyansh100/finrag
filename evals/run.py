@@ -167,10 +167,65 @@ def run_case(idx, case, retrieval_only=False):
     return checks
 
 
+def run_case_nlu(idx, case):
+    """Score ONLY the deterministic query-understanding checks.
+
+    Calls the standalone detect_* parsers directly instead of ask(), so this
+    needs no Chroma index and no Ollama — it runs in CI on a bare runner.
+    Covers the company / period / filter / numeric-intent expectations from
+    qa.yaml; retrieval and answer checks are out of scope here (they need the
+    vectorstore + LLM).
+    """
+    import query  # parsing layer; already pulled in via `from query import ask`
+
+    q = case["question"]
+    print(f"\n[{idx}] {YELLOW}{q}{RESET}")
+    checks = []
+
+    if "expect_company" in case:
+        got, exp = query.detect_company_filter(q), case["expect_company"]
+        ok = got == exp
+        checks.append(("company", ok))
+        print(_fmt(ok, "company", f"got={got!r} exp={exp!r}"))
+
+    if "expect_period" in case:
+        got, exp = query.detect_period_filter(q), case["expect_period"]
+        # Mirror the pipeline: ask() drops a detected period whose FY is outside
+        # the corpus range, but the raw parser doesn't. Apply the same guard so
+        # this check matches result["period_filter"] (e.g. "Q4 FY27" -> None).
+        if got:
+            import re as _re
+            import nlu
+            m = _re.search(r"FY(\d{2})$", got)
+            if m and int(m.group(1)) not in nlu.known_fys():
+                got = None
+        ok = got == exp
+        checks.append(("period", ok))
+        print(_fmt(ok, "period", f"got={got!r} exp={exp!r}"))
+
+    if "expect_filter" in case:
+        got, exp = query.detect_source_filter(q), case["expect_filter"]
+        ok = got == exp
+        checks.append(("filter", ok))
+        print(_fmt(ok, "filter", f"got={got!r} exp={exp!r}"))
+
+    exp_numeric = case.get("expect_numeric")
+    if exp_numeric is not None:
+        got = query.is_numeric_question(q)
+        ok = got == exp_numeric
+        checks.append(("numeric", ok))
+        print(_fmt(ok, "numeric-intent", f"got={got} exp={exp_numeric}"))
+
+    return checks
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--retrieval", action="store_true",
                         help="Skip LLM; score retrieval + filter + numeric only")
+    parser.add_argument("--nlu", action="store_true",
+                        help="Deterministic query-understanding checks only "
+                             "(no vectorstore, no Ollama) — the CI-safe subset")
     parser.add_argument("--case", type=int, default=None,
                         help="Run only this case index (0-based)")
     parser.add_argument("--file", default=str(Path(__file__).with_name("qa.yaml")))
@@ -188,7 +243,10 @@ def main():
 
     all_checks = []
     for i, case in enumerate(cases):
-        checks = run_case(i + idx_offset, case, retrieval_only=args.retrieval)
+        if args.nlu:
+            checks = run_case_nlu(i + idx_offset, case)
+        else:
+            checks = run_case(i + idx_offset, case, retrieval_only=args.retrieval)
         all_checks.extend(checks)
 
     print()

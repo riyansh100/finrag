@@ -1,0 +1,61 @@
+name: CI
+
+# Regression gate for the query-understanding layer. Runs the deterministic
+# slice of the eval suite (company / period / filter / numeric detection) on
+# every push and PR. No Ollama and no Chroma index are needed — those are
+# exercised locally via `python evals/run.py` / `--retrieval`.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nlu-evals:
+    runs-on: ubuntu-latest
+    env:
+      # settings.py has an insecure default key; set one explicitly so a future
+      # tightening of that default can't break CI. No real secret needed here.
+      DJANGO_SECRET_KEY: ci-not-a-real-secret
+      DJANGO_DEBUG: "True"
+      # --nlu makes no LLM calls, so no OpenRouter/Ollama credentials are needed.
+      LLM_PROVIDER: openrouter
+      OPENROUTER_API_KEY: unused-in-nlu-mode
+      # Cache layer falls back to SQLite when Redis is unreachable (no Redis here).
+      REDIS_URL: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # System libraries the import chain needs: tesseract (pytesseract),
+      # ghostscript (camelot), libgl/glib (opencv via camelot-py[cv]).
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr ghostscript libgl1 libglib2.0-0
+
+      # CPU-only PyTorch first so sentence-transformers (the reranker) doesn't
+      # drag in the multi-GB CUDA build. Mirrors the Dockerfile. Streamlit is
+      # the legacy UI and isn't needed to import the query layer.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          grep -ivE '^streamlit$' requirements.txt > /tmp/requirements.ci.txt
+          pip install -r /tmp/requirements.ci.txt
+
+      - name: Run NLU evals (deterministic, no models)
+        run: python evals/run.py --nlu
