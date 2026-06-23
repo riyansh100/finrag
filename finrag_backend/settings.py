@@ -39,6 +39,12 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "True").strip().lower() in ("1", "true", 
 # Comma-separated list, e.g. "localhost,127.0.0.1,example.com".
 ALLOWED_HOSTS = [h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
+# In local/dev (DEBUG), always allow the usual loopback hosts so `runserver` and
+# Docker (`0.0.0.0:8000`) work out of the box without a DisallowedHost wall.
+# Production (DEBUG=False) stays strict — set DJANGO_ALLOWED_HOSTS explicitly.
+if DEBUG:
+    ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS + ["localhost", "127.0.0.1", "0.0.0.0"]))
+
 
 # Application definition
 

@@ -17,8 +17,10 @@ services:
       # sibling services and the host:
       #   - Redis is the `redis` service below, not localhost.
       REDIS_URL: redis://redis:6379/0
-      #   - If LLM_PROVIDER=ollama, reach Ollama running on the host machine.
-      #     (Harmless when LLM_PROVIDER=openrouter.)
+      #   - Reach Ollama running on the host machine. REQUIRED even when
+      #     LLM_PROVIDER=openrouter: embeddings (nomic-embed-text) always use
+      #     Ollama. Start it on the host (`ollama serve`) or every query 500s
+      #     with "ConnectionError: Failed to connect to Ollama".
       OLLAMA_BASE_URL: http://host.docker.internal:11434
     volumes:
       # Persist runtime state across container rebuilds (these are .dockerignored
@@ -27,6 +29,11 @@ services:
       - ./vectorstore:/app/vectorstore
       - ./uploads:/app/uploads
       - ./data:/app/data
+      # Persist the HuggingFace model cache (the ~280MB bge-reranker + any
+      # sentence-transformers weights). Without this, the first query after
+      # every rebuild re-downloads the reranker — that's the ~1-minute cold
+      # start. Cached here, subsequent container recreates load it instantly.
+      - hf-cache:/root/.cache/huggingface
     depends_on:
       - redis
 
@@ -38,3 +45,4 @@ services:
 
 volumes:
   redis-data:
+  hf-cache:

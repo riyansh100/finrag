@@ -362,6 +362,34 @@ CLI fallback: `python query.py "your question"`.
 
 ---
 
+## Run with Docker
+
+```bash
+cp .env.example .env          # fill in OPENROUTER_API_KEY + DJANGO_SECRET_KEY
+docker compose up --build     # starts web + redis
+# open http://localhost:8000
+```
+
+The image is CPU-only (CPU PyTorch, no CUDA) and drops the legacy Streamlit UI.
+Runtime state (`db.sqlite3`, `vectorstore/`, `uploads/`, `data/`) is mounted as
+volumes, so it persists across rebuilds and is not baked into the image.
+
+> **Ollama is still required, even with OpenRouter.** The chat LLM can be
+> OpenRouter, but **embeddings always run through Ollama** (`nomic-embed-text`).
+> The container reaches Ollama on the host via `host.docker.internal:11434`, so
+> Ollama must be **running on your machine** (`ollama serve`) with the model
+> pulled (`ollama pull nomic-embed-text`). If it isn't, every query 500s with
+> `ConnectionError: Failed to connect to Ollama`.
+
+After editing `.env`, recreate the container so it reloads the values —
+a running container does **not** see `.env` edits:
+
+```bash
+docker compose up -d --force-recreate web
+```
+
+---
+
 ## Design decisions
 
 - **Two-stage retrieval (hybrid → cross-encoder).** Stage 1 (BM25 + vector + RRF) pulls a wide candidate shortlist; stage 2 (`bge-reranker-base`) rescores `(question, chunk)` jointly and keeps the best. Single biggest accuracy lift after hybrid itself, no chunking changes.
