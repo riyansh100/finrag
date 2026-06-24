@@ -22,6 +22,7 @@ We never lose coverage, we only gain it.
 """
 
 import json
+import re
 from functools import lru_cache
 
 from langchain_ollama import ChatOllama
@@ -240,6 +241,45 @@ def _get_llm():
     return _LLM
 
 
+def _loads_lenient(content):
+    """Best-effort parse of an LLM extraction response into a JSON object.
+
+    Free / instruct models are inconsistent even in JSON mode: the response can
+    arrive as a list of content blocks (langchain returns `content` as a list),
+    wrapped in ```json ... ``` fences, or with stray prose around the object.
+    Earlier this made `json.loads` raise (TypeError on a list, JSONDecodeError
+    on fenced/prose text) and silently drop the whole extraction to the regex
+    fallback. Normalise those shapes first; raise only if there's truly no JSON.
+    """
+    # 1. Content blocks -> joined text.
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(block.get("text") or block.get("content") or "")
+        content = "".join(parts)
+    if not isinstance(content, str):
+        content = str(content or "")
+
+    text = content.strip()
+    if not text:
+        raise ValueError("empty extraction response")
+
+    # 2. The common clean case.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Salvage: pull the outermost {...} object out of fences / prose.
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    raise ValueError("no JSON object in extraction response")
+
+
 def extract_slots(question, history=None, llm=None):
     """Run the structured-extraction call. Returns the validated slot dict, or
     None on ANY failure (timeout, bad JSON, empty after validation). The caller
@@ -261,8 +301,7 @@ def extract_slots(question, history=None, llm=None):
             ("system", _build_system_prompt()),
             ("human", user_msg),
         ])
-        content = getattr(msg, "content", None) or ""
-        raw = json.loads(content)
+        raw = _loads_lenient(getattr(msg, "content", None))
         slots = _coerce(raw)
         return _validate(slots)
     except Exception as e:
