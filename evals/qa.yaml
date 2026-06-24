@@ -231,3 +231,107 @@ cases:
     expect_substrings: []
     forbid_substrings: ["42,000", "45,000"]
     notes: "Period outside corpus. Must not invent a figure for a non-existent quarter."
+
+  # ---------------------------------------------------------------------------
+  # 9. Query-understanding coverage. These widen the deterministic layer
+  #    (company / period / currency / numeric resolution) that CI gates via
+  #    `python evals/run.py --nlu` — no vectorstore or LLM needed. Expectations
+  #    were captured from the live detectors, so they assert *actual* behavior.
+  #    Answer-figure assertions are intentionally omitted (no validated
+  #    MetricFact value to anchor them).
+  # ---------------------------------------------------------------------------
+
+  # Aliases + paraphrase: "infy"/"INFY" must resolve to infosys; "topline" -> revenue.
+  - question: "infy topline for Q2 FY24"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q2FY24
+    expect_numeric: true
+    notes: "Lowercase alias + slang metric ('topline')."
+
+  - question: "what is INFY net profit in Q3 FY23"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q3FY23
+    expect_numeric: true
+    notes: "Uppercase ticker alias."
+
+  # Currency intent: USD phrasing still scopes the same company/period.
+  - question: "infosys revenue Q1 FY25 in USD"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY25
+    expect_numeric: true
+    notes: "Explicit USD; detection should be currency-agnostic."
+
+  # Statement variety: cash-flow / EPS / margin / liability line items.
+  - question: "infosys cash flow for Q2 FY24"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q2FY24
+    expect_numeric: true
+
+  - question: "infosys earnings per share Q2 FY25"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q2FY25
+    expect_numeric: true
+
+  - question: "show infosys operating margin for Q1 FY24"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q1FY24
+    expect_numeric: true
+
+  - question: "infosys total liabilities Q3 FY24"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q3FY24
+    expect_numeric: true
+
+  # Period-first phrasing: the period leads the sentence.
+  - question: "Q3 FY22 infosys total equity"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: Q3FY22
+    expect_numeric: true
+    notes: "Period named before the company."
+
+  # Multi-period range: two+ periods -> NO single period_filter (fan-out handles it).
+  - question: "infosys net profit from Q1 FY23 to Q3 FY24"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: null
+    expect_numeric: true
+    notes: "Range spans many periods; no single period_filter."
+
+  # Multi-company: two companies -> NO single company_filter.
+  - question: "compare infosys and reliance revenue"
+    expect_filter: null
+    expect_company: null
+    expect_period: null
+    expect_numeric: true
+    notes: "Two companies; company_filter stays null."
+
+  # RIIL resolution from the full company name.
+  - question: "reliance industrial infrastructure revenue"
+    expect_filter: null
+    expect_company: riil
+    expect_period: null
+    expect_numeric: true
+
+  # Robustness: out-of-corpus FY must be dropped (no hallucinated quarter).
+  - question: "what was infosys revenue in FY30"
+    expect_filter: null
+    expect_company: infosys
+    expect_period: null
+    expect_numeric: true
+    notes: "FY30 outside corpus range -> period validated away."
+
+  # Off-topic: no company, no period, not a numeric ask.
+  - question: "tell me a joke"
+    expect_filter: null
+    expect_company: null
+    expect_period: null
+    expect_numeric: false
+    notes: "Non-financial; nothing should resolve."
