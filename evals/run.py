@@ -219,6 +219,57 @@ def run_case_nlu(idx, case):
     return checks
 
 
+def run_faithfulness(cases, idx_offset):
+    """Aggregate answer-grounding across the eval set into one trust metric.
+
+    For each question we generate a real answer and reuse verify.py's tracer
+    (already attached as result["verification"]): it checks every comma-grouped
+    figure in the answer against the retrieved chunks + MetricFact store. A
+    figure found nowhere is a hallucination.
+
+        groundedness = traced figures / checked figures
+        hallucination rate = 1 - groundedness
+
+    Needs the LLM + vectorstore + Ollama (real generation), so this is a local
+    metric, not part of CI. Exits non-zero if anything went unverified, so it
+    can double as a gate later.
+    """
+    total_checked = total_traced = 0
+    flagged = []
+
+    for i, case in enumerate(cases):
+        q = case["question"]
+        result = ask(q)
+        v = result.get("verification") or {}
+        checked, traced = v.get("checked", 0), v.get("traced", 0)
+        unverified = v.get("unverified", [])
+        total_checked += checked
+        total_traced += traced
+
+        status = v.get("status", "n/a")
+        color = GREEN if not unverified else RED
+        print(f"[{i + idx_offset}] {color}{status:<7}{RESET} "
+              f"traced {traced}/{checked}  {YELLOW}{q[:55]}{RESET}")
+        if unverified:
+            print(f"    {RED}unverified figures: {unverified}{RESET}")
+            flagged.append((q, unverified))
+
+    print()
+    print("=" * 60)
+    if total_checked == 0:
+        print("  no comma-grouped figures to check across the set")
+        sys.exit(0)
+    groundedness = total_traced / total_checked
+    print(f"  figures checked     {total_checked}")
+    print(f"  figures grounded    {total_traced}")
+    print(f"  {'GROUNDEDNESS':<18} {GREEN if not flagged else YELLOW}"
+          f"{groundedness:.0%}{RESET}")
+    print(f"  {'HALLUCINATION':<18} {RED if flagged else GREEN}"
+          f"{1 - groundedness:.0%}{RESET}  ({len(flagged)} answer(s) flagged)")
+    print("=" * 60)
+    sys.exit(0 if not flagged else 1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--retrieval", action="store_true",
@@ -226,6 +277,9 @@ def main():
     parser.add_argument("--nlu", action="store_true",
                         help="Deterministic query-understanding checks only "
                              "(no vectorstore, no Ollama) — the CI-safe subset")
+    parser.add_argument("--faithfulness", action="store_true",
+                        help="Generate answers and report groundedness / "
+                             "hallucination rate via verify.py (needs LLM)")
     parser.add_argument("--case", type=int, default=None,
                         help="Run only this case index (0-based)")
     parser.add_argument("--file", default=str(Path(__file__).with_name("qa.yaml")))
@@ -240,6 +294,10 @@ def main():
         idx_offset = args.case
     else:
         idx_offset = 0
+
+    if args.faithfulness:
+        run_faithfulness(cases, idx_offset)
+        return
 
     all_checks = []
     for i, case in enumerate(cases):
