@@ -155,7 +155,7 @@ python evals/run.py --faithfulness   # groundedness / hallucination rate over th
 ```
 
 - **`--nlu`** — checks company/period/currency/numeric detection against the live parsers. Deterministic, runs in seconds, **no Ollama or vector index needed**. This is the [GitHub Actions](.github/workflows/ci.yml) gate: every push must keep it green.
-- **`--faithfulness`** — generates real answers and reuses `verify.py`'s tracer to report a **groundedness score** (figures traceable to a source) and **hallucination rate**. On the current corpus this sits at **~93% grounded**, with the misses concentrated in multi-entity comparison questions.
+- **`--faithfulness`** — generates real answers and reuses `verify.py`'s tracer to report a **groundedness score** (figures traceable to a source) and **hallucination rate**. On the current 30-case set this sits at **~91% grounded**, and the misses concentrate on RIIL figures — which have no `MetricFact` backfill yet, so they can only be traced against retrieved chunks. Backfilling RIIL should push this higher.
 
 Why a split? Retrieval and answer quality need a built index + a running LLM, which a CI runner doesn't have. The understanding layer is pure and deterministic — so that's what guards every commit, while the heavier metrics are run locally.
 
