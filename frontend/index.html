@@ -21,6 +21,19 @@
 
     <!-- RIGHT: the active conversation -->
     <main id="main">
+      <!-- Per-chat toolbar: export the conversation as a formatted report.
+           Hidden until a chat with messages is open. -->
+      <div id="chat-toolbar" hidden>
+        <div class="export-menu">
+          <button id="export-btn" type="button"
+                  title="Download this conversation as a report">⬇ Export</button>
+          <div id="export-dropdown" class="export-dropdown" hidden>
+            <button type="button" data-format="pdf">PDF</button>
+            <button type="button" data-format="md">Markdown</button>
+          </div>
+        </div>
+      </div>
+
       <div id="messages">
         <div class="empty-state" id="empty-state">
           ◇ Select a query or start a new one to begin.

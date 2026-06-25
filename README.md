@@ -217,6 +217,7 @@ Base path `/api`. Highlights:
 | ------ | ------------------------- | ---------------------------------------------------------------- |
 | POST   | `/chats/{id}/messages`    | `{user_message, assistant_message, recall, chart, verification}` |
 | POST   | `/chats/{id}/uploads`     | Indexes an uploaded PDF into its own Chroma collection           |
+| GET    | `/chats/{id}/export?fmt=` | Downloads the conversation as a report — `pdf` (default), `md`, or `html` |
 | GET    | `/dashboard?company=<slug>` | Chart-ready series from `MetricFact` (SQL, no RAG)             |
 | GET    | `/recall?question=...`    | Related past analyses (pre-submit lookup)                        |
 

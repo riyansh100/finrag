@@ -1,12 +1,18 @@
 # Base image: a slim Debian with Python 3.13 preinstalled.
 FROM python:3.13-slim
 
-# System packages our pip deps need (OCR, table extraction, OpenCV runtime).
+# System packages our pip deps need (OCR, table extraction, OpenCV runtime,
+# plus pango/cairo/gdk-pixbuf for WeasyPrint's PDF report export).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         ghostscript \
         libgl1 \
         libglib2.0-0 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf-2.0-0 \
+        libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Don't buffer Python logs; don't write .pyc files. Cleaner container logs.

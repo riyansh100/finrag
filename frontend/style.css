@@ -718,3 +718,54 @@ html, body {
   border: 1px solid rgba(255, 92, 92, 0.4);
   cursor: help;
 }
+
+/* --- export toolbar ------------------------------------------------------- */
+/* Slim bar above the message pane; holds the "⬇ Export" report download. */
+#chat-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.export-menu { position: relative; }
+#export-btn {
+  background: transparent;
+  color: var(--amber);
+  border: 1px solid var(--amber-dim);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background 0.12s, box-shadow 0.12s;
+}
+#export-btn:hover {
+  background: rgba(46, 204, 113, 0.1);
+  box-shadow: 0 0 0 1px var(--amber-dim) inset;
+}
+.export-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  overflow: hidden;
+  z-index: 20;
+  min-width: 120px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+.export-dropdown button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--text);
+  border: none;
+  padding: 8px 14px;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.export-dropdown button:hover { background: var(--panel-3); color: var(--amber); }

@@ -9,12 +9,15 @@ Endpoints (all under /api/):
 """
 
 import config
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from modes import DEFAULT_MODE, MODES, list_modes
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
+
+import export as chat_export
 
 import facts as facts_pipeline
 import nlu
@@ -119,6 +122,49 @@ def chat_detail(request, chat_id):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     return Response(ChatDetailSerializer(chat).data)
+
+
+@api_view(["GET"])
+def chat_export_view(request, chat_id):
+    """GET /api/chats/{id}/export?fmt=pdf|md|html  ->  downloadable report.
+
+    Turns the whole conversation into a nicely formatted, self-contained file
+    (see export.py). `fmt` defaults to pdf. (The param is `fmt`, not `format`:
+    DRF reserves `format` for content negotiation.) Responses set
+    Content-Disposition so the browser downloads rather than renders -- the
+    frontend just navigates to this URL. PDF requires WeasyPrint; when it's
+    unavailable we return 503 with a message pointing at the md/html
+    alternatives."""
+    chat = get_object_or_404(Chat, pk=chat_id)
+    fmt = (request.query_params.get("fmt") or "pdf").lower()
+
+    if fmt == "md":
+        body = chat_export.chat_to_markdown(chat)
+        resp = HttpResponse(body, content_type="text/markdown; charset=utf-8")
+        ext = "md"
+    elif fmt == "html":
+        body = chat_export.chat_to_html(chat)
+        resp = HttpResponse(body, content_type="text/html; charset=utf-8")
+        ext = "html"
+    elif fmt == "pdf":
+        try:
+            body = chat_export.chat_to_pdf(chat)
+        except RuntimeError as e:
+            return Response(
+                {"detail": str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        resp = HttpResponse(body, content_type="application/pdf")
+        ext = "pdf"
+    else:
+        return Response(
+            {"detail": f"Unknown format '{fmt}'. Use pdf, md, or html."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    filename = chat_export.export_filename(chat, ext)
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
 
 
 def _upload_to_dict(u: UploadedDoc) -> dict:

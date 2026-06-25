@@ -19,3 +19,5 @@ sentence-transformers
 langchain-openai
 pyyaml
 python-dotenv
+markdown
+weasyprint

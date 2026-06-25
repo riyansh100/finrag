@@ -8,6 +8,8 @@ urlpatterns = [
     path("chats", views.chat_list, name="chat-list"),
     path("chats/<int:chat_id>", views.chat_detail, name="chat-detail"),
     path("chats/<int:chat_id>/messages", views.message_create, name="message-create"),
+    # Download the whole conversation as a formatted report: ?format=pdf|md|html.
+    path("chats/<int:chat_id>/export", views.chat_export_view, name="chat-export"),
     # Slice-4: per-chat on-the-fly PDF uploads. Indexed into their own Chroma
     # collection and searched alongside the corpus when attached to a turn.
     path("chats/<int:chat_id>/uploads",

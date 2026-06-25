@@ -59,3 +59,10 @@ jobs:
 
       - name: Run NLU evals (deterministic, no models)
         run: python evals/run.py --nlu
+
+      # Deterministic Django tests (chat export: PDF/Markdown/HTML report
+      # download). No LLM, no Chroma index. The PDF test degrades to a clean
+      # 503 when WeasyPrint's pango/cairo libs are absent (as here), so it's
+      # green without installing them.
+      - name: Run Django tests
+        run: python manage.py test chat.tests

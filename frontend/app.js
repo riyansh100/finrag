@@ -143,6 +143,7 @@ async function refreshSidebar() {
 function clearMessages() {
   $("#messages").innerHTML =
     '<div class="empty-state">◇ Select a query or start a new one to begin.</div>';
+  updateExportToolbar();
 }
 
 function renderSources(sources) {
@@ -212,6 +213,7 @@ function addMessage({ role, content, sources = [], flags = [], mode = "" }) {
 
   $("#messages").appendChild(msg);
   scrollToBottom();
+  updateExportToolbar();
   return msg;
 }
 
@@ -514,6 +516,7 @@ async function openDashboard() {
 
   const pane = $("#messages");
   pane.innerHTML = "";
+  updateExportToolbar();  // activeChatId is null here -> hides the export button
   const wrap = el("div", "dashboard");
   wrap.appendChild(Object.assign(el("h2", "dash-title"),
     { textContent: "Financial Dashboard" }));
@@ -659,6 +662,34 @@ function setComposerEnabled(enabled) {
   $("#mode-select").disabled = !enabled || modes.length === 0;
   $("#attach-btn").disabled = !enabled;
 }
+
+// --- export toolbar ----------------------------------------------------------
+// Show the "⬇ Export" control only when a chat with at least one message is
+// open (nothing to export from an empty/closed chat). Each menu item just
+// navigates to the export endpoint with Content-Disposition: attachment, so the
+// browser handles the download — no fetch/blob plumbing needed.
+function updateExportToolbar() {
+  const hasMessages = !!activeChatId && !!$("#messages .msg");
+  $("#chat-toolbar").hidden = !hasMessages;
+  if (!hasMessages) $("#export-dropdown").hidden = true;
+}
+
+$("#export-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const dd = $("#export-dropdown");
+  dd.hidden = !dd.hidden;
+});
+
+$("#export-dropdown").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-format]");
+  if (!btn || !activeChatId) return;
+  window.location.href =
+    `${API}/chats/${activeChatId}/export?fmt=${btn.dataset.format}`;
+  $("#export-dropdown").hidden = true;
+});
+
+// Close the dropdown on any outside click.
+document.addEventListener("click", () => { $("#export-dropdown").hidden = true; });
 
 // --- wire up events ----------------------------------------------------------
 $("#new-chat-btn").addEventListener("click", startNewChat);
