@@ -102,7 +102,7 @@ A question flows through roughly these stages (all in [`query.py`](query.py)):
 
 | Layer          | Choice                                                                              |
 | -------------- | ----------------------------------------------------------------------------------- |
-| Chat LLM       | Swappable: OpenRouter (any OpenAI-compatible model) or Ollama (`minimax-m3:cloud`)  |
+| Chat LLM       | Swappable: OpenRouter (any OpenAI-compatible model) or Ollama (`minimax-m3` / `gpt-oss` / etc.) |
 | Embeddings     | `nomic-embed-text` (768-dim) via Ollama, with `search_query:`/`search_document:` prefixes |
 | Vector store   | ChromaDB (cosine), persisted to disk                                                |
 | Keyword search | `rank-bm25` via LangChain `BM25Retriever`                                            |
