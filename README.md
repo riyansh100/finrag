@@ -21,7 +21,7 @@ Bot:  ## Balance Sheet — Infosys, Q1 FY24 (₹ crore)
 
 <!-- Replace the line below: on github.com, edit this README, drag your .mp4 in
      here, and GitHub inserts a player URL automatically. Keep it on its own line. -->
-https://github.com/USER/REPO/assets/REPLACE-ME.mp4
+[DEMO LINK](https://github.com/riyansh100/finrag/blob/44cc991984a9d535dfcb7b72a43c5de0d987fb36/FinRAG%20recording.mp4)
 
 One query each in **Extract**, **Analyze**, and **Compare** mode. *(On-the-fly PDF upload isn't shown in this clip.)*
 
