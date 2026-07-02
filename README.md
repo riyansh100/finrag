@@ -17,6 +17,18 @@ Bot:  ## Balance Sheet — Infosys, Q1 FY24 (₹ crore)
 
 ---
 
+## Demo
+
+<!-- Replace the line below: on github.com, edit this README, drag your .mp4 in
+     here, and GitHub inserts a player URL automatically. Keep it on its own line. -->
+https://github.com/USER/REPO/assets/REPLACE-ME.mp4
+
+One query each in **Extract**, **Analyze**, and **Compare** mode. *(On-the-fly PDF upload isn't shown in this clip.)*
+
+> **⏱️ On speed — and why the clip is trimmed.** FinRAG runs entirely on **free models** (local Ollama embeddings + a free cloud/local chat model), so a single answer can take **50–70s** while the model streams. We trimmed those waits to keep the demo watchable — the pipeline, prompts, and outputs are otherwise unedited. Latency is a function of the free tier, not the retrieval logic; a paid or GPU-hosted model returns the same answers in a few seconds.
+
+---
+
 ## What it can do
 
 - **Hybrid retrieval + reranking** — keyword (BM25) and semantic (vector) search are fused, then a cross-encoder re-scores the shortlist for the final, sharper ranking.
